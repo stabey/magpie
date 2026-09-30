@@ -11,6 +11,9 @@ const I18N = {
     "Usage": "用量",
     "Library": "资源库",
     "Settings": "设置",
+    "Minimise": "最小化",
+    "Maximise": "最大化",
+    "Restore": "还原",
     "Refresh model lists (models.dev and every vendor)": "刷新模型列表（models.dev 与各供应商）",
     "Open as a window": "在窗口中打开",
     "Open magpie": "打开 magpie",
@@ -1684,6 +1687,7 @@ function translateStatic() {
   for (const e of document.querySelectorAll("[data-tt]")) {
     if (e.dataset.enTitle === undefined) e.dataset.enTitle = e.title;
     e.title = t(e.dataset.enTitle);
+    if (e.classList.contains("caption")) e.setAttribute("aria-label", e.title);
   }
   for (const e of document.querySelectorAll("[data-tp]")) {
     if (e.dataset.enPlaceholder === undefined) e.dataset.enPlaceholder = e.placeholder;

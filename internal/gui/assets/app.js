@@ -11,8 +11,10 @@ if (web) document.body.classList.add("web");
 // The Mac window draws its title bar inside the page (the traffic lights);
 // on Linux the page's header is the whole title bar (plainTitlebar), so it
 // has the name, the close button and a double-click to maximise.
+// Windows uses the same header in a frameless window, with caption buttons.
 if (!web && /^Mac/.test(navigator.platform)) document.body.classList.add("mac");
 if (!web && /^Linux/.test(navigator.platform)) document.body.classList.add("linux");
+if (!web && /^Win/.test(navigator.platform)) document.body.classList.add("win");
 // Windows: its own UI faces by name, Chinese in Microsoft YaHei UI rather
 // than whatever the webview falls back to for it
 if (/^Win/.test(navigator.platform)) document.documentElement.classList.add("win");
@@ -8709,8 +8711,30 @@ $("#open").onclick = () => api("window/main", {});
 $("#openMain").onclick = () => api("window/main", {});
 $("#quit").onclick = () => api("window/quit", {});
 $("#winclose").onclick = () => winRuntime.then((w) => w?.Window.Close()); // hides it: the tray stays
+const windowsTitlebar = mode === "window" && document.body.classList.contains("win");
+if (windowsTitlebar) {
+  $("#windowControls").hidden = false;
+  $("#windowMinimise").onclick = () => winRuntime.then((w) => w?.Window.Minimise());
+  $("#windowMaximise").onclick = () => winRuntime.then((w) => w?.Window.ToggleMaximise());
+  $("#windowClose").onclick = () => winRuntime.then((w) => w?.Window.Close());
+  // Also update after native maximise/restore (double-click, snapping, Win+Up).
+  const syncMaximise = () => winRuntime.then(async (w) => {
+    if (!w?.Window.IsMaximised) return;
+    const maximised = await w.Window.IsMaximised();
+    const button = $("#windowMaximise");
+    button.classList.toggle("restored", maximised);
+    button.dataset.enTitle = maximised ? "Restore" : "Maximise";
+    button.title = t(button.dataset.enTitle);
+    button.setAttribute("aria-label", button.title);
+  });
+  winRuntime.then((w) => {
+    w?.Events?.On("common:WindowMaximise", syncMaximise);
+    w?.Events?.On("common:WindowUnMaximise", syncMaximise);
+    syncMaximise();
+  });
+} else $("#windowControls").remove();
 $(".top").addEventListener("dblclick", (e) => {
-  if (document.body.classList.contains("linux") && !e.target.closest("button, nav")) winRuntime.then((w) => w?.Window.ToggleMaximise());
+  if ((windowsTitlebar || document.body.classList.contains("linux")) && !e.target.closest("button, nav")) winRuntime.then((w) => w?.Window.ToggleMaximise());
 });
 if (mode === "window") { $("#open").remove(); $("#openMain").remove(); $("#quit").remove(); }
 else { $("#nav").remove(); }

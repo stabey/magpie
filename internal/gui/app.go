@@ -288,7 +288,7 @@ func Run(version string, showMain bool, link string) error {
 	}
 	// and no smaller than its page's least at the text size
 	minW, minH := windowMin(zoom, 0, 0)
-	h.main = h.app.Window.NewWithOptions(application.WebviewWindowOptions{
+	mainOptions := application.WebviewWindowOptions{
 		Name:      "main",
 		Title:     "magpie",
 		URL:       "/?" + theme,
@@ -303,7 +303,27 @@ func Run(version string, showMain bool, link string) error {
 			// it, tabs included; the header marks what drags instead
 			TitleBar: application.MacTitleBarHiddenInset,
 		},
-	})
+	}
+	if runtime.GOOS == "windows" {
+		// Draw the title bar in the page, retaining native resize borders,
+		// shadows and rounded corners. Composition hosting lets our caption
+		// buttons participate in Windows hit testing (including Snap Layouts).
+		mainOptions.Frameless = true
+		// DWMWA_COLOR_NONE: keep the shadow without the system accent border.
+		borderColour := uint32(0xfffffffe)
+		borderTheme := &application.WindowTheme{BorderColour: &borderColour}
+		mainOptions.Windows = application.WindowsWindow{
+			NonClientRegionSupport:     true,
+			WebView2CompositionHosting: true,
+			CustomTheme: application.ThemeSettings{
+				DarkModeActive:    borderTheme,
+				DarkModeInactive:  borderTheme,
+				LightModeActive:   borderTheme,
+				LightModeInactive: borderTheme,
+			},
+		}
+	}
+	h.main = h.app.Window.NewWithOptions(mainOptions)
 	// A resize is kept once it settles; a maximised or full-screen window
 	// is the screen's size, not one the user gave it.
 	var resized *time.Timer
