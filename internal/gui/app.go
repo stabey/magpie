@@ -306,15 +306,15 @@ func Run(version string, showMain bool, link string) error {
 	}
 	if runtime.GOOS == "windows" {
 		// Draw the title bar in the page, retaining native resize borders,
-		// shadows and rounded corners. Composition hosting lets our caption
-		// buttons participate in Windows hit testing (including Snap Layouts).
+		// shadows and rounded corners. The caption buttons are plain page
+		// buttons: WebView2's composition hosting would let Windows see them
+		// (Snap Layouts on hover), but routes all of the window's input
+		// through the host, which forwards neither touch nor UI Automation.
 		mainOptions.Frameless = true
 		// DWMWA_COLOR_NONE: keep the shadow without the system accent border.
 		borderColour := uint32(0xfffffffe)
 		borderTheme := &application.WindowTheme{BorderColour: &borderColour}
 		mainOptions.Windows = application.WindowsWindow{
-			NonClientRegionSupport:     true,
-			WebView2CompositionHosting: true,
 			CustomTheme: application.ThemeSettings{
 				DarkModeActive:    borderTheme,
 				DarkModeInactive:  borderTheme,

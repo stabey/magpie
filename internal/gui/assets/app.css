@@ -160,9 +160,6 @@ body.window.win .actions { align-self: stretch; align-items: center; }
 .caption-glyph { font: calc(10px / var(--zoom, 1)) "Segoe MDL2 Assets"; pointer-events: none; }
 .caption .restore-glyph, .caption.restored .maximize-glyph { display: none; }
 .caption.restored .restore-glyph { display: inline; }
-#windowMinimise { --wails-non-client-region: minimize; }
-#windowMaximise { --wails-non-client-region: maximize; }
-#windowClose { --wails-non-client-region: close; }
 #windowClose:hover { background: #c42b1c; color: #fff; }
 #windowClose:active { background: #a82318; color: #fff; }
 /* Linux: the header is the title bar, so it closes the window too — round,

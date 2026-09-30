@@ -8717,7 +8717,9 @@ if (windowsTitlebar) {
   $("#windowMinimise").onclick = () => winRuntime.then((w) => w?.Window.Minimise());
   $("#windowMaximise").onclick = () => winRuntime.then((w) => w?.Window.ToggleMaximise());
   $("#windowClose").onclick = () => winRuntime.then((w) => w?.Window.Close());
-  // Also update after native maximise/restore (double-click, snapping, Win+Up).
+  // Also update after a native maximise or restore (Win+Up/Down, snapping,
+  // dragging a maximised window off the top): each resizes the page, while
+  // Wails sends WindowUnMaximise only when it unmaximises the window itself.
   const syncMaximise = () => winRuntime.then(async (w) => {
     if (!w?.Window.IsMaximised) return;
     const maximised = await w.Window.IsMaximised();
@@ -8727,11 +8729,8 @@ if (windowsTitlebar) {
     button.title = t(button.dataset.enTitle);
     button.setAttribute("aria-label", button.title);
   });
-  winRuntime.then((w) => {
-    w?.Events?.On("common:WindowMaximise", syncMaximise);
-    w?.Events?.On("common:WindowUnMaximise", syncMaximise);
-    syncMaximise();
-  });
+  addEventListener("resize", syncMaximise);
+  syncMaximise();
 } else $("#windowControls").remove();
 $(".top").addEventListener("dblclick", (e) => {
   if ((windowsTitlebar || document.body.classList.contains("linux")) && !e.target.closest("button, nav")) winRuntime.then((w) => w?.Window.ToggleMaximise());
