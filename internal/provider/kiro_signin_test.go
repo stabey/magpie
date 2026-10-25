@@ -267,3 +267,53 @@ func TestKiroSignInExternalIdP(t *testing.T) {
 		t.Fatalf("status %+v", st)
 	}
 }
+
+func TestKiroPastedCallback(t *testing.T) {
+	for _, aws := range []bool{false, true} {
+		name := "social"
+		if aws {
+			name = "aws-two-stage"
+		}
+		t.Run(name, func(t *testing.T) {
+			start, _ := kiroFakeSignIn(t)
+			st, q := start()
+			if !st.PasteCallback {
+				t.Fatal("paste mode missing")
+			}
+			bad := q.Get("redirect_uri") + "/oauth/callback?code=gcode&state=wrong&login_option=google"
+			if err := SubmitSignInCallback(st.ID, bad); err == nil {
+				t.Fatal("wrong state accepted")
+			}
+			back := q.Get("redirect_uri") + "/oauth/callback?login_option=google&code=gcode&state=" + q.Get("state")
+			want := "me@example.com"
+			if aws {
+				first := q.Get("redirect_uri") + "/signin/callback?login_option=builderid&issuer_url=" + url.QueryEscape("https://view.awsapps.com/start") + "&idc_region=us-east-1&state=" + q.Get("state")
+				if err := SubmitSignInCallback(st.ID, first); err != nil {
+					t.Fatal(err)
+				}
+				next, _ := SignInStatus(st.ID)
+				if next.State != "waiting" || next.URL == st.URL {
+					t.Fatalf("no next step: %+v", next)
+				}
+				if err := SubmitSignInCallback(st.ID, first); err == nil {
+					t.Fatal("old stage replay accepted")
+				}
+				u, _ := url.Parse(next.URL)
+				a := u.Query()
+				kiroSetAWSChallenge(a.Get("code_challenge"))
+				back = a.Get("redirect_uri") + "?code=awscode&state=" + a.Get("state")
+				want = "builder@example.com"
+			}
+			if err := SubmitSignInCallback(st.ID, back); err != nil {
+				t.Fatal(err)
+			}
+			if err := SubmitSignInCallback(st.ID, back); err == nil {
+				t.Fatal("duplicate callback accepted")
+			}
+			done := waitDone(t, st.ID)
+			if done.State != "done" || done.User != want {
+				t.Fatalf("result: %+v", done)
+			}
+		})
+	}
+}

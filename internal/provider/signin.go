@@ -72,6 +72,9 @@ type signInFlow struct {
 	kiro              *kiroFlow
 	dimagentDone      chan dimagentCallback
 	dimagentSubmitted bool
+	callbackSubmitted bool
+	callbackMu        sync.Mutex
+	pasteCallback     func(string) error
 	site              string // where to sign in, for an agent with more than one (ZCode: "zai" or "bigmodel")
 	done              chan struct{}
 }
@@ -304,6 +307,7 @@ func (s *signInFlow) begin() error {
 	}
 
 	if ln != nil {
+		s.st.PasteCallback = true
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", s.callback)
 		srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
@@ -364,11 +368,40 @@ func SubmitSignInCallback(id, raw string) error {
 	if !ok {
 		return errors.New("no such sign-in")
 	}
-	got, err := dimAgentCallbackFromPaste(raw)
+	s.mu.Lock()
+	paste := s.pasteCallback
+	s.mu.Unlock()
+	if paste != nil {
+		return paste(raw)
+	}
+	if s.status().Agent == "dimagent" {
+		got, err := dimAgentCallbackFromPaste(raw)
+		if err != nil {
+			return err
+		}
+		return s.submitDimAgentCallback(got)
+	}
+	s.mu.Lock()
+	redirect, supported := s.redirect, s.st.PasteCallback
+	s.mu.Unlock()
+	if !supported {
+		return errors.New("this sign-in does not accept a callback URL")
+	}
+	u, err := url.Parse(strings.TrimSpace(raw))
+	expected, _ := url.Parse(redirect)
+	if err != nil || u.User != nil || u.Fragment != "" || u.Scheme != expected.Scheme || u.Host != expected.Host || u.Path != expected.Path {
+		return errors.New("paste the complete callback URL from this sign-in, with its original localhost address")
+	}
+	q, err := url.ParseQuery(u.RawQuery)
 	if err != nil {
+		return errors.New("invalid callback query")
+	}
+	if err := s.claimCallback(q); err != nil {
 		return err
 	}
-	return s.submitDimAgentCallback(got)
+	// Process locally with the original PKCE verifier; never fetch the pasted URL.
+	go s.completeCallback(context.Background(), callbackSink{}, q)
+	return nil
 }
 
 // WaitSignIn blocks until a sign-in is over, for the command line.
@@ -442,10 +475,39 @@ func (s *signInFlow) callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	if s.status().State != "waiting" {
-		signInPage(w, false, "This sign-in is over", "Start it again from magpie.")
+	if err := s.claimCallback(q); err != nil {
+		signInPage(w, false, "Sign-in didn't finish", err.Error())
 		return
 	}
+	s.completeCallback(r.Context(), w, q)
+}
+
+// claimCallback makes both delivery paths one-shot, including OAuth errors.
+func (s *signInFlow) claimCallback(q url.Values) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.st.State != "waiting" || s.callbackSubmitted {
+		return errors.New("this sign-in is no longer waiting for a callback")
+	}
+	if len(q["state"]) != 1 || q.Get("state") == "" || q.Get("state") != s.state {
+		return errors.New("the callback belongs to another sign-in; use the URL from this sign-in")
+	}
+	if len(q["code"]) > 1 || len(q["error"]) > 1 || (q.Get("code") == "" && q.Get("error") == "") {
+		return errors.New("that URL carries no unique authorization code or error")
+	}
+	s.callbackSubmitted = true
+	return nil
+}
+
+// callbackSink discards the browser success page for a manually submitted URL.
+// The caller follows the outcome through the existing sign-in status endpoint.
+type callbackSink struct{}
+
+func (callbackSink) Header() http.Header         { return http.Header{} }
+func (callbackSink) Write(b []byte) (int, error) { return len(b), nil }
+func (callbackSink) WriteHeader(int)             {}
+
+func (s *signInFlow) completeCallback(parent context.Context, w http.ResponseWriter, q url.Values) {
 	if e := q.Get("error"); e != "" {
 		msg := q.Get("error_description")
 		if msg == "" {
@@ -455,12 +517,7 @@ func (s *signInFlow) callback(w http.ResponseWriter, r *http.Request) {
 		signInPage(w, false, "Sign-in didn't finish", msg)
 		return
 	}
-	if q.Get("state") != s.state || q.Get("code") == "" {
-		// not ours: someone else's page, or a stale tab
-		signInPage(w, false, "This link isn't from magpie's sign-in", "Start it again from magpie.")
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 	if app, ok := googleAppOf(s.st.Agent); ok {
 		s.googleDone(ctx, w, app, q.Get("code"))

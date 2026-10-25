@@ -5,7 +5,7 @@ const path = require("node:path");
 const { test } = require("node:test");
 const { chromium } = require("playwright");
 
-test("DimAgent callback input retries errors and submits only once", async (t) => {
+for (const agent of ["dimagent", "codex", "kiro", "zed", "commandcode-plan"]) test(agent + " callback input retries errors and submits only once", async (t) => {
   const browser = await chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chromium" });
   t.after(() => browser.close());
   const page = await browser.newPage({ viewport: { width: 420, height: 640 } });
@@ -41,15 +41,15 @@ test("DimAgent callback input retries errors and submits only once", async (t) =
   });
   await page.goto("http://magpie.test/");
   await page.waitForFunction(() => state.settings.lang === "zh");
-  await page.evaluate(() => {
-    signing = { id: "test-flow", agent: "dimagent", state: "waiting", url: "http://vendor.test/oauth", pasteCallback: true };
+  await page.evaluate((agent) => {
+    signing = { id: "test-flow", agent, state: "waiting", url: "http://vendor.test/oauth", pasteCallback: true };
     const host = document.createElement("div");
     host.style.width = "100%";
     host.style.cssText += "position:fixed;inset:0 auto auto 0;z-index:1000;";
-    host.append(renderSigning({ name: "DimAgent", agent: "dimagent" }));
+    host.append(renderSigning({ name: agent === "codex" ? "ChatGPT" : "DimAgent", agent }));
     document.body.append(host);
-  });
-  const input = page.getByRole("textbox", { name: "回调 URL" });
+  }, agent);
+  const input = page.getByRole("textbox", { name: agent === "commandcode-plan" ? "回调 URL 或 JSON" : "回调 URL" });
   const submit = page.getByRole("button", { name: "完成登录" });
   assert(await submit.isDisabled());
   await input.fill("http://localhost:54321/auth/callback?code=bad&state=wrong");
@@ -72,7 +72,7 @@ test("DimAgent callback input retries errors and submits only once", async (t) =
   assert(box.x >= 0 && box.x + box.width <= 420, "callback input overflowed the narrow window");
   if (process.env.ARTIFACT_DIR) {
     await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
-    await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, "signin-callback.png") });
+    await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `signin-callback-${agent}.png`) });
   }
   assert.deepEqual(errors, []);
 });

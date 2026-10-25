@@ -526,6 +526,9 @@ func startCommandCodeSignIn(s *signInFlow) error {
 	s.mu.Lock()
 	s.st.URL = cmdStudio + "/studio/auth/cli?" + q.Encode()
 	s.srv = srv
+	s.redirect = q.Get("callback")
+	s.st.PasteCallback = true
+	s.pasteCallback = s.pasteCommandCodeCallback
 	s.mu.Unlock()
 	go func() { _ = srv.Serve(ln) }()
 	return nil
@@ -608,8 +611,8 @@ func (s *signInFlow) commandCodeCallback(w http.ResponseWriter, r *http.Request)
 		signInPage(w, false, "This link isn't from magpie's sign-in", "Start it again from magpie.")
 		return
 	}
-	if s.status().State != "waiting" {
-		answer(false, "this sign-in is over")
+	if err := s.claimCallback(url.Values{"state": {got.State}, "code": {got.APIKey}, "error": {got.Error}}); err != nil {
+		answer(false, err.Error())
 		return
 	}
 	if got.Error != "" {
@@ -702,3 +705,41 @@ func cmdSignedIn(ctx context.Context, a cmdAuth) (who, plan string, err error) {
 	}
 	return who, plan, nil
 }
+
+// Command Code sends a POST payload rather than an authorization code URL.
+// Accept its JSON payload, or a callback URL that carries the same fields.
+func (s *signInFlow) pasteCommandCodeCallback(raw string) error {
+	raw = strings.TrimSpace(raw)
+	body := raw
+	contentType := "application/json"
+	if !strings.HasPrefix(raw, "{") {
+		u, err := pastedCallbackURL(raw, s.redirect, "/callback")
+		if err != nil {
+			return err
+		}
+		fields := map[string]string{}
+		for k, values := range u.Query() {
+			fields[k] = values[0]
+		}
+		b, _ := json.Marshal(fields)
+		body = string(b)
+	}
+	r, err := http.NewRequest(http.MethodPost, s.redirect, strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	r.Header.Set("Content-Type", contentType)
+	w := &pasteCallbackResponse{}
+	s.commandCodeCallback(w, r)
+	if w.status >= 400 {
+		return errors.New("callback rejected: include the current sign-in state and its apiKey, or start sign-in again")
+	}
+	return nil
+}
+
+type pasteCallbackResponse struct {
+	callbackSink
+	status int
+}
+
+func (w *pasteCallbackResponse) WriteHeader(code int) { w.status = code }

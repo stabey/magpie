@@ -4347,7 +4347,7 @@ async function followSignIn(id) {
     if (signing?.id !== id) continue;
     if (st.state === "waiting" || st.state === "installing") {
       // the CLI it needed is in: now the vendor's page can open
-      if (signing.state === "installing" && st.state === "waiting" && st.url) api("open", { url: st.url }).catch(() => {});
+      if (st.state === "waiting" && st.url && (signing.state === "installing" || signing.url !== st.url)) api("open", { url: st.url }).catch(() => {});
       if (signing.state !== st.state || signing.url !== st.url) { signing = { ...st, site: signing.site }; renderProviders(); }
       continue;
     }
@@ -4516,10 +4516,11 @@ function renderSigning(sub) {
   }
   if (signing.pasteCallback) {
     const flow = signing;
-    tt.append(el("span", "s", t("If the browser cannot return to magpie, paste its final callback URL here.")));
+    tt.append(el("span", "s", t(sub.agent === "commandcode-plan" ? "Command Code sends login data by POST. Paste its callback JSON (including state and apiKey), or a callback URL containing those fields." : web ? "After signing in, localhost may not open because magpie is on a server. Copy the complete URL from that tab’s address bar and paste it here." : "If the browser cannot return to magpie, paste its final callback URL here.")));
     const form = el("form", "callback-form");
-    const url = input(flow.callbackURL || "", t("Callback URL"));
-    url.setAttribute("aria-label", t("Callback URL"));
+    const label = t(sub.agent === "commandcode-plan" ? "Callback URL or JSON" : "Callback URL");
+    const url = input(flow.callbackURL || "", label);
+    url.setAttribute("aria-label", label);
     url.autocomplete = "off";
     url.disabled = !!flow.callbackSubmitted || !!flow.callbackSubmitting;
     const submit = el("button", "text primary", t("Finish sign-in"));

@@ -365,10 +365,27 @@ For the browser UI run the image with `magpie web --addr 0.0.0.0:3430 --no-open`
 in place of the default `serve`, and open
 `http://localhost:3430/?k=<key from docker logs magpie>` (set `MAGPIE_WEB_KEY`
 to keep one key across restarts). There you add providers and import
-sign-ins from a file; a subscription sign-in started in the container cannot
-finish, because the vendor sends the browser back to the container's own
-loopback, so sign in on a machine where magpie runs with a browser. Keys and
-sign-ins live in the volume, so a restart keeps them.
+sign-ins from a file. Keys and sign-ins live in the volume, so a restart
+keeps them.
+
+#### Signing in to a remotely hosted gateway
+
+When `magpie web` runs on a remote server or in a container, the vendor's
+localhost callback opens on the computer running your browser, not on the
+server running magpie. For ChatGPT, Claude, Gemini, Antigravity, Devin,
+Kiro, Zed and DimAgent, copy the complete final callback URL from the
+browser's address bar (even if localhost fails to open), paste it into the
+pending sign-in in magpie, and select **Finish sign-in**. Keep that sign-in
+open: the server retains the state and credentials needed to finish it.
+The URL is processed against that pending sign-in; magpie does not fetch it.
+
+Kiro AWS sign-ins have a second authorization page; open the updated sign-in
+link and paste that page's final callback too. Command Code posts login data
+instead: paste its callback JSON with `state` and `apiKey`, or a callback URL
+containing those fields. A URL without that payload cannot finish it.
+Device-code and polling sign-ins need no localhost callback. CLI-managed
+sign-ins may still require their own remote-login method or importing
+credentials.
 
 ### Developing
 

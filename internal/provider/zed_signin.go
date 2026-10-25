@@ -32,6 +32,23 @@ func startZedSignIn(s *signInFlow) error {
 	port := ln.Addr().(*net.TCPAddr).Port
 	type callback struct{ uid, token string }
 	got := make(chan callback, 1)
+	submit := func(uid, tok string) error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.st.State != "waiting" || s.callbackSubmitted {
+			return errors.New("this sign-in is no longer waiting for a callback")
+		}
+		if uid == "" || tok == "" {
+			return errors.New("the callback needs user_id and access_token")
+		}
+		// Only a token encrypted to this login's private key can complete it.
+		if _, err := zed.Decrypt(key, tok); err != nil {
+			return errors.New("the callback does not belong to this Zed sign-in")
+		}
+		s.callbackSubmitted = true
+		got <- callback{uid, tok}
+		return nil
+	}
 	mux := http.NewServeMux()
 	// Zed's page sends the browser to the port on whatever path; the query is
 	// what counts
@@ -42,9 +59,9 @@ func startZedSignIn(s *signInFlow) error {
 			http.NotFound(w, r)
 			return
 		}
-		select {
-		case got <- callback{uid, tok}:
-		default:
+		if err := submit(uid, tok); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 		http.Redirect(w, r, zedSite+"/native_app_signin_succeeded", http.StatusFound)
 	})
@@ -53,6 +70,15 @@ func startZedSignIn(s *signInFlow) error {
 	s.mu.Lock()
 	s.st.URL = zed.SignInURL(zedSite, port, pub, systemID)
 	s.srv, s.stop = srv, cancel
+	s.st.PasteCallback = true
+	s.pasteCallback = func(raw string) error {
+		u, err := pastedCallbackURL(raw, fmt.Sprintf("http://localhost:%d", port))
+		if err != nil {
+			return err
+		}
+		q := u.Query()
+		return submit(q.Get("user_id"), q.Get("access_token"))
+	}
 	s.mu.Unlock()
 	go func() { _ = srv.Serve(ln) }()
 

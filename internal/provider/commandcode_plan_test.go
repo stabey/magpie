@@ -248,3 +248,49 @@ func TestCommandCodeSignInWhoamiDown(t *testing.T) {
 		}
 	}
 }
+
+func TestCommandCodePastedCallback(t *testing.T) {
+	signIn(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/alpha/whoami" {
+			json.NewEncoder(w).Encode(map[string]any{"user": map[string]any{"id": "paste-id", "userName": "paste-user"}})
+		} else {
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+	old := cmdAPI
+	cmdAPI = srv.URL
+	t.Cleanup(func() { cmdAPI = old })
+	for _, asURL := range []bool{false, true} {
+		st, err := StartSignIn(CommandCodePlanID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { CancelSignIn(st.ID) })
+		if !st.PasteCallback {
+			t.Fatal("paste mode missing")
+		}
+		auth, _ := url.Parse(st.URL)
+		q := auth.Query()
+		if err := SubmitSignInCallback(st.ID, `{"state":"wrong","apiKey":"key"}`); err == nil {
+			t.Fatal("wrong state accepted")
+		}
+		if err := SubmitSignInCallback(st.ID, `{"state":"`+q.Get("state")+`"}`); err == nil {
+			t.Fatal("missing key accepted")
+		}
+		raw := `{"state":"` + q.Get("state") + `","apiKey":"paste-key","userName":"paste-user"}`
+		if asURL {
+			raw = q.Get("callback") + "?state=" + q.Get("state") + "&apiKey=paste-key&userName=paste-user"
+		}
+		if err := SubmitSignInCallback(st.ID, raw); err != nil {
+			t.Fatal(err)
+		}
+		if err := SubmitSignInCallback(st.ID, raw); err == nil {
+			t.Fatal("duplicate accepted")
+		}
+		if done := waitDone(t, st.ID); done.State != "done" || done.User != "paste-user" {
+			t.Fatalf("result: %+v", done)
+		}
+	}
+}

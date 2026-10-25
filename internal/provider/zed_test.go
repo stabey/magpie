@@ -203,3 +203,45 @@ func TestZedFreePlanQuota(t *testing.T) {
 		t.Fatalf("quota %+v", q)
 	}
 }
+
+func TestZedPastedCallback(t *testing.T) {
+	signIn(t)
+	z := zedStub(t, "zed_pro")
+	st, err := StartSignIn("zed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { CancelSignIn(st.ID) })
+	if !st.PasteCallback {
+		t.Fatal("paste mode missing")
+	}
+	u, _ := url.Parse(st.URL)
+	q := u.Query()
+	z.systemID = q.Get("system_id")
+	der, _ := base64.URLEncoding.DecodeString(q.Get("native_app_public_key"))
+	pk, err := x509.ParsePKCS1PublicKey(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, pk, []byte("plain-access"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := "http://localhost:" + q.Get("native_app_port") + "/?user_id=4242&access_token="
+	if err := SubmitSignInCallback(st.ID, base+"bad-token"); err == nil {
+		t.Fatal("invalid ciphertext accepted")
+	}
+	if current, _ := SignInStatus(st.ID); current.State != "waiting" {
+		t.Fatal("bad paste ended login")
+	}
+	back := base + url.QueryEscape(base64.URLEncoding.EncodeToString(ct))
+	if err := SubmitSignInCallback(st.ID, back); err != nil {
+		t.Fatal(err)
+	}
+	if err := SubmitSignInCallback(st.ID, back); err == nil {
+		t.Fatal("duplicate accepted")
+	}
+	if done := dimagentWaitSignIn(t, st.ID); done.State != "done" || done.User != "octo" {
+		t.Fatalf("result: %+v", done)
+	}
+}

@@ -118,12 +118,84 @@ func startKiroSignIn(s *signInFlow, challenge string) (net.Listener, error) {
 	q.Set("redirect_from", "KiroIDE")
 	s.mu.Lock()
 	s.st.URL = kiroPortalURL + "/signin?" + q.Encode()
+	s.pasteCallback = s.pasteKiroCallback
 	s.mu.Unlock()
 	return ln, nil
 }
 
 // kiroCallback is the browser back from Kiro's page, or from AWS's.
 func (s *signInFlow) kiroCallback(w http.ResponseWriter, r *http.Request) {
+	s.callbackMu.Lock()
+	defer s.callbackMu.Unlock()
+	if err := s.claimKiroCallback(r.URL); err != nil {
+		signInPage(w, false, "Sign-in didn't finish", err.Error())
+		return
+	}
+	s.completeKiroCallback(w, r)
+}
+
+func (s *signInFlow) pasteKiroCallback(raw string) error {
+	s.callbackMu.Lock()
+	defer s.callbackMu.Unlock()
+	base := s.redirect
+	if s.kiro.state != "" {
+		base = s.kiro.awsRedirect()
+	}
+	u, err := pastedCallbackURL(raw, base, "/oauth/callback", "/signin/callback")
+	if err != nil {
+		return err
+	}
+	if err := s.claimKiroCallback(u); err != nil {
+		return err
+	}
+	r := &http.Request{Method: http.MethodGet, URL: u, Header: make(http.Header)}
+	s.completeKiroCallback(callbackSink{}, r)
+	return nil
+}
+
+// Called with callbackMu held, so only one callback can advance either stage.
+func (s *signInFlow) claimKiroCallback(u *url.URL) error {
+	if u.Path != "/oauth/callback" && u.Path != "/signin/callback" {
+		return errors.New("invalid Kiro callback path")
+	}
+	q, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return errors.New("invalid callback query")
+	}
+	state := s.state
+	if s.kiro.state != "" {
+		state = s.kiro.state
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.st.State != "waiting" || s.callbackSubmitted {
+		return errors.New("this sign-in is no longer waiting for a callback")
+	}
+	if len(q["state"]) != 1 || q.Get("state") != state {
+		return errors.New("the callback belongs to another sign-in")
+	}
+	for _, name := range []string{"code", "error", "login_option", "issuer_url", "idc_region"} {
+		if len(q[name]) > 1 {
+			return errors.New("duplicate callback parameter")
+		}
+	}
+	if q.Get("error") == "" {
+		if s.kiro.state != "" || q.Get("login_option") == "google" || q.Get("login_option") == "github" {
+			if q.Get("code") == "" {
+				return errors.New("that URL carries no code")
+			}
+		} else if q.Get("login_option") == "" {
+			return errors.New("that URL carries no login option")
+		}
+	}
+	if region := q.Get("idc_region"); strings.Trim(region, "abcdefghijklmnopqrstuvwxyz0123456789-") != "" {
+		return errors.New("invalid AWS region")
+	}
+	s.callbackSubmitted = true
+	return nil
+}
+
+func (s *signInFlow) completeKiroCallback(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/oauth/callback", "/signin/callback":
 	default:
@@ -232,7 +304,12 @@ func (s *signInFlow) kiroCallback(w http.ResponseWriter, r *http.Request) {
 			a.Set("state", k.state)
 			a.Set("code_challenge", base64.RawURLEncoding.EncodeToString(sum[:]))
 			a.Set("code_challenge_method", "S256")
-			http.Redirect(w, r, kiroOIDC(region)+"/authorize?"+a.Encode(), http.StatusFound)
+			next := kiroOIDC(region) + "/authorize?" + a.Encode()
+			s.mu.Lock()
+			s.st.URL = next
+			s.callbackSubmitted = false
+			s.mu.Unlock()
+			http.Redirect(w, r, next, http.StatusFound)
 			return
 		case "external_idp":
 			fail("magpie can't sign in with a company's own identity provider yet; sign in with `kiro-cli login`, and magpie uses that")
