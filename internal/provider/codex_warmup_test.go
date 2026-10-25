@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/catalog"
 )
 
 const (
@@ -49,6 +51,9 @@ func TestWarmDue(t *testing.T) {
 			win("7 days", week, 0, now.Add(2*24*time.Hour)), true},
 		{"reset early: no window running", warmWindow{ResetsAt: now.Add(2 * 24 * time.Hour), Used: 70}, true, idleNow, true},
 		{"an unused window sliding on", warmWindow{ResetsAt: now.Add(week - 5*time.Minute)}, true, idleNow, false},
+		{"reset early, nothing used before", warmWindow{ResetsAt: now.Add(5 * 24 * time.Hour)}, true, idleNow, true},
+		{"reset early, nothing used before, left out", warmWindow{ResetsAt: now.Add(5 * 24 * time.Hour)}, true, win("7 days", week, 0, time.Time{}), true},
+		{"running, nothing used yet", warmWindow{ResetsAt: now.Add(5 * 24 * time.Hour)}, true, win("7 days", week, 0, now.Add(5*24*time.Hour)), false},
 		{"a stale read past its reset", warmWindow{ResetsAt: now.Add(-time.Minute), Used: 50}, true,
 			win("7 days", week, 50, now.Add(-time.Minute)), true},
 		{"a failed warm-up", warmWindow{Pending: true, Failed: 1}, true, running, true},
@@ -88,7 +93,7 @@ func (f *fakeWarm) warmer(path string) codexWarmer {
 
 func (f *fakeWarm) run(t *testing.T, path, which string) []CodexWarm {
 	t.Helper()
-	return f.warmer(path).warmNow(context.Background(), which, "")
+	return f.warmer(path).warmNow(context.Background(), which, nil)
 }
 
 func TestCodexWarmOncePerReset(t *testing.T) {
@@ -131,6 +136,7 @@ func TestCodexWarmOncePerReset(t *testing.T) {
 	// OpenAI resets b early: its use falls to nothing before its reset
 	f.ws["b@example.com"][0].Used = 0
 	f.now = f.now.Add(5 * time.Minute)
+	bWarmed := f.now
 	if rs := f.run(t, path, "week"); len(rs) != 1 || rs[0].User != "b@example.com" {
 		t.Fatalf("early reset: %+v", rs)
 	}
@@ -147,8 +153,10 @@ func TestCodexWarmOncePerReset(t *testing.T) {
 	if rs := f.run(t, path, "week"); len(rs) != 0 {
 		t.Fatalf("the 5-hour window, weekly only: %+v", rs)
 	}
-	f.ws["a@example.com"][1] = win("7 days", week, 0, f.now.Add(week))
-	f.ws["b@example.com"][0] = win("7 days", week, 0, f.now.Add(week))
+	// both weeks running from their warm-ups, nothing used: each reset a
+	// week from its warm-up, as the backend reports a started window
+	f.ws["a@example.com"][1] = win("7 days", week, 0, resets.Add(time.Minute+week))
+	f.ws["b@example.com"][0] = win("7 days", week, 0, bWarmed.Add(week))
 	var hours []string
 	for _, r := range f.run(t, path, "all") {
 		hours = append(hours, r.User+":"+strings.Join(r.Windows, "+"))
@@ -156,6 +164,89 @@ func TestCodexWarmOncePerReset(t *testing.T) {
 	// a's week is running (warmed above, its reset a week off): only its 5 hours
 	if strings.Join(hours, ",") != "a@example.com:5 hours" {
 		t.Fatalf("all: %v", hours)
+	}
+}
+
+// shangyuan0818 (10-24): a reset card spent on a weekly window, the
+// warm-up after it, nothing used since, then OpenAI resets everyone's
+// limits. The window had no use to fall from and its old reset hadn't
+// come, so the official reset went without a warm-up.
+func TestWarmAfterResetCardThenOfficialReset(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		which  string
+		window string
+		span   time.Duration
+		expect []QuotaWindow
+		// left out: the backend leaves a window not started out of its read
+		// (Anthropic), rather than reporting its reset a whole span away
+		leftOut bool
+	}{
+		{"codex week", "week", "7 days", week, nil, false},
+		{"codex 5 hours", "all", "5 hours", fiveHours, nil, false},
+		{"claude week, left out", "week", "7 days", week, claudeWindowsExpected, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "codex-warmup.json")
+			start := time.Date(2026, 10, 22, 9, 0, 0, 0, time.UTC)
+			f := &fakeWarm{now: start, errs: map[string]error{}}
+			idleAt := func(now time.Time) QuotaWindow {
+				if c.leftOut {
+					return QuotaWindow{}
+				}
+				return win(c.window, c.span, 0, now.Add(c.span))
+			}
+			set := func(w QuotaWindow) {
+				if w.Span == 0 {
+					f.ws["a@example.com"] = nil
+				} else {
+					f.ws["a@example.com"] = []QuotaWindow{w}
+				}
+			}
+			f.ws = map[string][]QuotaWindow{
+				"a@example.com": {win(c.window, c.span, 55, start.Add(c.span/2))},
+				// another account, running all along: never sent one
+				"b@example.com": {win(c.window, c.span, 20, start.Add(c.span*9/10))},
+			}
+			w := f.warmer(path)
+			w.expect = c.expect
+			run := func() { w.warmNow(context.Background(), c.which, nil) }
+			run()
+			// a reset card is spent: the window starts over, at nothing used
+			f.now = start.Add(5 * time.Minute)
+			set(idleAt(f.now))
+			run()
+			if strings.Join(f.sent, ",") != "a@example.com" {
+				t.Fatalf("after the reset card, sent %v", f.sent)
+			}
+			// the warm-up started it; nothing is used after
+			warmed := f.now
+			set(win(c.window, c.span, 0, warmed.Add(c.span)))
+			for f.now.Before(warmed.Add(c.span / 3)) {
+				f.now = f.now.Add(codexWarmEvery)
+				run()
+			}
+			if len(f.sent) != 1 {
+				t.Fatalf("a running window sent again: %v", f.sent)
+			}
+			// OpenAI resets everyone's limits: not started again
+			official := f.now
+			f.now = official.Add(codexWarmEvery)
+			set(idleAt(f.now))
+			run()
+			if strings.Join(f.sent, ",") != "a@example.com,a@example.com" {
+				t.Fatalf("after the official reset, sent %v", f.sent)
+			}
+			// that one started it: once
+			set(win(c.window, c.span, 0, f.now.Add(c.span)))
+			for range 12 {
+				f.now = f.now.Add(codexWarmEvery)
+				run()
+			}
+			if len(f.sent) != 2 {
+				t.Fatalf("sent again after the window started: %v", f.sent)
+			}
+		})
 	}
 }
 
@@ -252,7 +343,7 @@ func TestCodexWarmRequest(t *testing.T) {
 	loginUsageCache.m = nil
 	loginUsageCache.Unlock()
 	w := codexWarmer{path: codexWarmPath(), now: time.Now, usage: codexWarmUsage, send: warmCodexLogin}
-	rs := w.warmNow(context.Background(), "week", "")
+	rs := w.warmNow(context.Background(), "week", nil)
 	if len(rs) != 1 || rs[0].User != "me@example.com" || rs[0].Err != "" {
 		t.Fatalf("warm: %+v", rs)
 	}
@@ -273,10 +364,45 @@ func TestCodexWarmRequest(t *testing.T) {
 		t.Fatalf("headers: %v", hdr)
 	}
 	// a second look, the read cached: nothing more is sent
-	if rs := w.warmNow(context.Background(), "week", ""); len(rs) != 0 || len(got) != 1 {
+	if rs := w.warmNow(context.Background(), "week", nil); len(rs) != 0 || len(got) != 1 {
 		t.Fatalf("again: %+v", rs)
 	}
 	if CodexWarmed()["me@example.com"].IsZero() {
 		t.Fatalf("not kept: %v", CodexWarmed())
+	}
+}
+
+// #604: the warm-up asks the cheapest model, by price where it is known,
+// else a mini, else a luna, else the first listed.
+func TestWarmPick(t *testing.T) {
+	ids := func(ids ...string) []catalog.Model {
+		ms := make([]catalog.Model, len(ids))
+		for i, id := range ids {
+			ms[i] = catalog.Model{ID: id}
+		}
+		return ms
+	}
+	prices := map[string]catalog.Price{
+		"gpt-6.1-sol": {Input: 2, Output: 10}, "gpt-6-astra": {Input: 10, Output: 50},
+		"gpt-6-luna": {Input: 0.1, Output: 0.5}, "gpt-5.6-luna": {Input: 0.2, Output: 1.2},
+	}
+	priced := func(id string) (catalog.Price, bool) { p, ok := prices[id]; return p, ok }
+	none := func(string) (catalog.Price, bool) { return catalog.Price{}, false }
+	gpt6 := ids("gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5")
+	for _, c := range []struct {
+		name  string
+		ms    []catalog.Model
+		price func(string) (catalog.Price, bool)
+		want  string
+	}{
+		{"priced", gpt6, priced, "gpt-6-luna"},
+		{"no prices: a luna", gpt6, none, "gpt-6-luna"},
+		{"no prices: a mini first", ids("gpt-5-codex", "gpt-5-codex-mini", "gpt-6-luna"), none, "gpt-5-codex-mini"},
+		{"no prices, no cheap name", ids("gpt-6.1-sol", "gpt-6-sol"), none, "gpt-6.1-sol"},
+		{"the model's own price first", []catalog.Model{{ID: "gpt-6.1-sol"}, {ID: "x", Price: &catalog.Price{Input: 0.01, Output: 0.01}}}, priced, "x"},
+	} {
+		if got := warmPick(c.ms, c.price).ID; got != c.want {
+			t.Errorf("%s: %s, want %s", c.name, got, c.want)
+		}
 	}
 }

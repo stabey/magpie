@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -13,7 +14,7 @@ import (
 func isLink(t *testing.T, p string) bool {
 	t.Helper()
 	fi, err := os.Lstat(p)
-	return err == nil && fi.Mode()&os.ModeSymlink != 0
+	return err == nil && linkEntry(fi)
 }
 
 func gone(t *testing.T, p string) {
@@ -71,7 +72,7 @@ func TestProjectSkillsLinked(t *testing.T) {
 	}
 
 	// removing the project takes away all it placed, and its lines
-	ok(t)(RemoveProject(proj))
+	ok(t)(RemoveProject(proj, false))
 	gone(t, filepath.Join(proj, ".agents"))
 	if g := read(t, filepath.Join(proj, ".gitignore")); g != "node_modules/\n" {
 		t.Errorf(".gitignore after: %q", g)
@@ -111,9 +112,36 @@ func TestProjectSkillsCopied(t *testing.T) {
 		t.Error("the copy wasn't made again")
 	}
 	// back to links: the copy becomes a link
+	// (not on Windows, where a copy as fresh as the library's stands for one)
 	ok(t)(ProjectCopy(proj, false))
-	if !isLink(t, p) {
+	if runtime.GOOS != "windows" && !isLink(t, p) {
 		t.Error("still a copy")
+	}
+}
+
+func TestProjectSkillScanErrorPreservesCopy(t *testing.T) {
+	h, proj := projectLib(t)
+	ok(t)(ProjectCopy(proj, true))
+	ok(t)(ProjectSkill(proj, "pdf", []string{"claude"}))
+	p := filepath.Join(proj, ".claude/skills/pdf")
+	// Copies from before marks kept hashes must reject incomplete scans too.
+	write(t, filepath.Join(p, marker), "copied from "+skillDir("pdf")+"\n")
+	write(t, filepath.Join(p, "scripts/run.sh"), "echo mine\n")
+	write(t, filepath.Join(h, "src/pdf/scripts/run.sh"), "echo library update\n")
+	blocked := filepath.Join(p, "scripts")
+	blockSkillSubtree(t, proj, blocked)
+	r, err := Sync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Problems) != 1 || r.Problems[0].Agent != proj || !strings.Contains(r.Problems[0].Error, blocked) {
+		t.Fatalf("unreadable project copy wasn't reported: %+v", r.Problems)
+	}
+	if err := os.Chmod(blocked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(p, "scripts/run.sh")); got != "echo mine\n" {
+		t.Fatalf("unreadable project copy's edit was replaced: %q", got)
 	}
 }
 
@@ -138,7 +166,7 @@ func TestProjectRefusesForeignFolder(t *testing.T) {
 	}
 	// removing the project leaves the folder that isn't magpie's
 	ok(t)(ProjectSkill(proj, "pdf", nil))
-	ok(t)(RemoveProject(proj))
+	ok(t)(RemoveProject(proj, false))
 	if _, err := os.Stat(filepath.Join(proj, ".claude/skills/pdf/SKILL.md")); err != nil {
 		t.Error("the project's own went")
 	}
@@ -152,8 +180,8 @@ func TestProjectRefusesHomeAndUnknownAgents(t *testing.T) {
 	if _, err := AddProject(proj); err == nil {
 		t.Error("added twice")
 	}
-	if _, err := ProjectSkill(proj, "pdf", []string{"goose"}); err == nil {
-		t.Error("goose given a project skill")
+	if _, err := ProjectSkill(proj, "pdf", []string{"crush"}); err == nil {
+		t.Error("crush given a project skill")
 	}
 }
 
@@ -193,7 +221,7 @@ func TestUpdateSkillRefreshesProjects(t *testing.T) {
 		ok(t)(ProjectSkill(p, "docx", []string{"codex"}))
 	}
 	version = "two"
-	ok(t)(UpdateSkill("pdf"))
+	ok(t)(UpdateSkill("pdf", false))
 	ok(t)(UpdateSomeSkills([]string{"docx"}))
 	for _, p := range []string{linked, copied} {
 		for _, e := range []string{".claude/skills/pdf", ".agents/skills/docx"} {

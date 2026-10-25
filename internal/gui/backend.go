@@ -11,6 +11,8 @@ import (
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/update"
+	"github.com/yetone/magpie/internal/usage"
 )
 
 // served is the gateway this process serves, nil while another magpie
@@ -38,7 +40,19 @@ func stopServing() {
 func startBackend() (gw *gateway.Server) {
 	gateway.Window = true // the routing this process serves is shown on its page
 	gw = serveGateway()
-	go watchGateway()
+	go watchGateway(backendCtx, gatewayWatch)
+	// the usage log parsed now, not when the tray panel first asks for
+	// today's calls (CyberCaius)
+	go usage.ReadAhead()
+	// Codex's background app-server, restarted when it has the list from
+	// before a change and no codex session is on it (luci)
+	go agent.KeepCodexDaemonCurrent(backendCtx)
+	// the Codex app, reopened once its account is used up and magpie is
+	// its provider, which it reads only as it opens (MasterYi)
+	go keepCodexAppSending(backendCtx)
+	// the compactions magpie made in Codex's threads written as Codex's
+	// own, so a thread goes on when Codex talks to OpenAI itself
+	go agent.KeepCodexRolloutsPortable(backendCtx)
 	// Model lists are fetched, never compiled in: whatever the agents can see
 	// comes from the models.dev catalog plus each vendor's own /models answer.
 	// Keep both halves warm without making the user click anything.
@@ -62,32 +76,87 @@ func startBackend() (gw *gateway.Server) {
 	return gw
 }
 
-var gatewayWatch = 15 * time.Second
+// gatewayWatch is how often a magpie without the gateway looks for it gone.
+const gatewayWatch = 15 * time.Second
 
-// watchGateway takes the gateway up once the magpie that had it is gone.
-func watchGateway() {
+// watchGateway takes the gateway up once the magpie that had it is gone,
+// looking every so often until ctx ends: a watch that outlived it would
+// start a gateway after this one has stopped serving.
+func watchGateway(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
 	for {
-		time.Sleep(gatewayWatch)
-		if served.Load() == nil && !gateway.Running() {
-			serveGateway()
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
 		}
+		gatewayMu.Lock()
+		if ctx.Err() == nil && served.Load() == nil && !gateway.Running() {
+			serveGatewayLocked()
+		}
+		gatewayMu.Unlock()
 	}
+}
+
+// takenSaid: the log has said the gateway's port is taken by one that
+// doesn't answer, said once until it is free again.
+var takenSaid atomic.Bool
+
+// gatewayMu keeps one start of the gateway here at a time: the watch's,
+// a restart's, a take-over's (takeover.go).
+var gatewayMu sync.Mutex
+
+// servedRun ends the gateway this process serves, and is closed once it
+// has, for a restart; under gatewayMu.
+var servedRun struct {
+	stop context.CancelFunc
+	done chan struct{}
 }
 
 // serveGateway starts the gateway here when no magpie has it: the one
 // started, or nil.
 func serveGateway() *gateway.Server {
+	gatewayMu.Lock()
+	defer gatewayMu.Unlock()
+	return serveGatewayLocked()
+}
+
+func serveGatewayLocked() *gateway.Server {
 	// handing over, the one there is this one's predecessor, which lets go
 	// once this one listens beside it
-	if !gateway.Handover && gateway.Running() {
-		return nil
+	// so is the one that handed this one its socket, still finishing its
+	// requests on it (gui/handover.go)
+	if !gateway.Handover && !gateway.Inherited() {
+		if o := gateway.ServedBy(); o.Running {
+			if update.Newer(gateway.Version, o.Version) {
+				log.Printf("gateway: magpie %s serves %s, older than this one (%s); agents' requests go through it until it quits", o.Version, gateway.URL(), gateway.Version)
+			}
+			return nil
+		}
+		// a magpie too busy to answer the question in time (a small
+		// server, one starting), or another program, has the port: a
+		// second listen only fails (K.Liu on Discord: magpie web beside
+		// the service logged "bind: address already in use")
+		if gateway.Taken() {
+			if !takenSaid.Swap(true) {
+				log.Printf("gateway: %s is taken but doesn't answer as magpie yet; this magpie serves the gateway once it is free", gateway.URL())
+			}
+			return nil
+		}
 	}
+	takenSaid.Store(false)
 	gw := gateway.New()
 	served.Store(gw)
 	serving.Add(1)
+	ctx, stop := context.WithCancel(backendCtx)
+	done := make(chan struct{})
+	servedRun.stop, servedRun.done = stop, done
 	go func() {
 		defer serving.Done()
-		if err := gw.ListenAndServe(backendCtx); err != nil {
+		defer close(done)
+		defer stop()
+		if err := gw.ListenAndServe(ctx); err != nil {
 			log.Println("gateway:", err)
 			served.CompareAndSwap(gw, nil) // another took the port first
 		}

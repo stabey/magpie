@@ -2,6 +2,7 @@ package gui
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/library"
+	"github.com/yetone/magpie/internal/mcpauth"
 )
 
 // The problems of the last change to the library stay on the page until the
@@ -28,16 +30,55 @@ type libraryJSON struct {
 	Problems []library.Problem `json:"problems,omitempty"`
 }
 
-func libraryView(res *library.Result) (libraryJSON, error) {
+func libraryView(res *library.Result) (libraryJSON, error) { return libraryRead(res, false) }
+
+// libraryRead is libraryView, or with glance the page but for what takes
+// reading the agents' skill folders through (library.Glance), for the
+// page to show at once while the rest is read (#541).
+func libraryRead(res *library.Result, glance bool) (libraryJSON, error) {
 	lastProblems.Lock()
 	if res != nil {
 		lastProblems.p = res.Problems
 	}
 	p := lastProblems.p
 	lastProblems.Unlock()
-	v, err := library.Read(p)
+	read := library.Read
+	if glance {
+		read = library.Glance
+	}
+	v, err := read(p)
 	home, _ := os.UserHomeDir()
 	return libraryJSON{View: v, Result: res, Home: home, Problems: p}, err
+}
+
+// instructionsJSON answers a change to the instructions: what the page's
+// Instructions tab shows, without reading the rest of the library again.
+// That read goes through every agent's skill folders, which on Windows made
+// each instruction made, saved or removed take up to a minute (#1624).
+type instructionsJSON struct {
+	Part         string                    `json:"part"` // "instructions": the page keeps the rest it has
+	Instructions *library.InstructionsView `json:"instructions"`
+	Result       *library.Result           `json:"result,omitempty"`
+	Problems     []library.Problem         `json:"problems,omitempty"`
+}
+
+func instructionsView(res *library.Result) (instructionsJSON, error) {
+	lastProblems.Lock()
+	// an instruction change wrote only the instructions: the problems the
+	// last change had with servers and skills still stand
+	p := []library.Problem{}
+	for _, x := range lastProblems.p {
+		if x.What != "instructions" {
+			p = append(p, x)
+		}
+	}
+	if res != nil {
+		p = append(p, res.Problems...)
+	}
+	lastProblems.p = p
+	lastProblems.Unlock()
+	iv, err := library.ReadInstructions()
+	return instructionsJSON{Part: "instructions", Instructions: iv, Result: res, Problems: p}, err
 }
 
 // marketJSON is a market's list, and why it may be short: a search that
@@ -45,6 +86,21 @@ func libraryView(res *library.Result) (libraryJSON, error) {
 type marketJSON struct {
 	Items any    `json:"items"`
 	Error string `json:"error,omitempty"`
+	// Custom is a server to add by hand, for a search that is an address
+	// nothing listed is at
+	Custom *library.Custom `json:"custom,omitempty"`
+	// Failed is the source the search couldn't reach, and Cause why; the
+	// items are then what the others found (#1589)
+	Failed string `json:"failed,omitempty"`
+	Cause  string `json:"cause,omitempty"`
+}
+
+func marketOf(items any, err error) marketJSON {
+	m := marketJSON{Items: items, Error: errText(err)}
+	if se := (*library.SearchError)(nil); errors.As(err, &se) {
+		m.Failed, m.Cause = se.Source, se.Err.Error()
+	}
+	return m
 }
 
 func errText(err error) string {
@@ -75,13 +131,16 @@ func revealable(v *library.View) []string {
 		for _, e := range p.Placed {
 			out = append(out, filepath.Join(p.Dir, filepath.FromSlash(e)))
 		}
+		for f := range p.Wrote {
+			out = append(out, filepath.Join(p.Dir, filepath.FromSlash(f)))
+		}
 	}
 	return out
 }
 
 func libraryRoutes(mux *http.ServeMux, w Windows) {
 	mux.HandleFunc("GET /api/library", func(rw http.ResponseWriter, r *http.Request) {
-		v, err := libraryView(nil)
+		v, err := libraryRead(nil, r.URL.Query().Get("glance") == "1")
 		if err != nil {
 			fail(rw, err)
 			return
@@ -100,11 +159,13 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 	// once asked for, which skills.sh gives one at a time
 	mux.HandleFunc("GET /api/library/market/servers", func(rw http.ResponseWriter, r *http.Request) {
 		list, err := library.MarketServers(r.URL.Query().Get("q"))
-		writeJSON(rw, marketJSON{Items: list, Error: errText(err)})
+		m := marketOf(list, err)
+		m.Custom = library.CustomAt(r.URL.Query().Get("q"), list)
+		writeJSON(rw, m)
 	})
 	mux.HandleFunc("GET /api/library/market/skills", func(rw http.ResponseWriter, r *http.Request) {
 		list, err := library.MarketSkills(r.URL.Query().Get("q"))
-		writeJSON(rw, marketJSON{Items: list, Error: errText(err)})
+		writeJSON(rw, marketOf(list, err))
 	})
 	mux.HandleFunc("POST /api/library/market/about", func(rw http.ResponseWriter, r *http.Request) {
 		var in struct{ IDs []string }
@@ -155,19 +216,44 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 		}
 		writeJSON(rw, v)
 	})
+	// Group again: the skills traced to their repositories once more, the
+	// page as it is then with how many joined a group
+	mux.HandleFunc("POST /api/library/skills/regroup", func(rw http.ResponseWriter, r *http.Request) {
+		n, err := library.RegroupSkills()
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		v, err := libraryView(nil)
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, struct {
+			libraryJSON
+			Regrouped int `json:"regrouped"`
+		}{v, n})
+	})
 	// RTK:which agents have its hook, switching one on or off, and
 	// installing rtk when the page is asked to
 	mux.HandleFunc("GET /api/library/rtk", func(rw http.ResponseWriter, r *http.Request) {
 		v := library.ReadRTK()
-		// its latest release, when GitHub answers in time: the page is
-		// drawn without it otherwise, and has it next time
+		// its latest release, and what the package manager it was installed
+		// with has of that release, when GitHub answers in time: the page is
+		// drawn without them otherwise, and has them next time
 		if v.Path != "" {
-			latest := make(chan string, 1)
-			go func() { latest <- library.RTKLatest() }()
+			checked := make(chan *library.RTKView, 1)
+			go func() { c := *v; c.CheckLatest(); checked <- &c }()
 			select {
-			case v.Latest = <-latest:
+			case v = <-checked:
 			case <-time.After(3 * time.Second):
 			}
+			// what the package manager has is asked after the answer goes out:
+			// `winget show` refreshes its sources and takes seconds, which is
+			// longer than the wait above, so asking it there held the whole tab
+			// for a tag that then never arrived (#1025). It is one read of the
+			// tab away, and the answer is kept for hours either way.
+			go library.CheckChannel(v)
 		}
 		writeJSON(rw, v)
 	})
@@ -189,6 +275,15 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 	})
 	mux.HandleFunc("POST /api/library/rtk/upgrade", func(rw http.ResponseWriter, r *http.Request) {
 		v, err := library.UpgradeRTK()
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, v)
+	})
+	// rtk put on the PATH the agents get, when magpie found it off it
+	mux.HandleFunc("POST /api/library/rtk/path", func(rw http.ResponseWriter, r *http.Request) {
+		v, err := library.PathRTK()
 		if err != nil {
 			fail(rw, err)
 			return
@@ -246,6 +341,85 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 		}
 		rw.WriteHeader(http.StatusNoContent)
 	})
+	// magpie signs in to a remote server once, for every agent given it (#615)
+	mux.HandleFunc("POST /api/library/mcp-signin", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ Name string }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Name == "" {
+			http.Error(rw, "no server", http.StatusBadRequest)
+			return
+		}
+		st, err := library.SignInServer(r.Context(), in.Name)
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, mcpSignInOpened{st, openError(w, st.URL)})
+	})
+	mux.HandleFunc("GET /api/library/mcp-signin/{id}", func(rw http.ResponseWriter, r *http.Request) {
+		st, ok := mcpauth.Progress(r.PathValue("id"))
+		if !ok {
+			http.NotFound(rw, r)
+			return
+		}
+		writeJSON(rw, st)
+	})
+	mux.HandleFunc("POST /api/library/mcp-signin/{id}/cancel", func(rw http.ResponseWriter, r *http.Request) {
+		mcpauth.Cancel(r.PathValue("id"))
+		rw.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /api/library/mcp-signout", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ Name string }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Name == "" {
+			http.Error(rw, "no server", http.StatusBadRequest)
+			return
+		}
+		if err := library.SignOutServer(in.Name); err != nil {
+			fail(rw, err)
+			return
+		}
+		v, err := libraryView(nil)
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, v)
+	})
+	// whether the servers work, by connecting to them: those named, or every
+	// one; a server checked this session as it is now is answered from then
+	mux.HandleFunc("POST /api/library/mcp/check", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Names []string
+			Fresh bool
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		m, err := library.CheckServers(r.Context(), in.Names, in.Fresh)
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, map[string]any{"servers": m})
+	})
+	// the servers as an agent's project file has them, for the user to
+	// paste into a project magpie doesn't keep (#1478); nothing is written
+	mux.HandleFunc("POST /api/library/mcp/config", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Agent string
+			Names []string
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		c, err := library.ConfigOfServers(in.Agent, in.Names)
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, c)
+	})
 	// every change answers with the page as it is after it, and what it did
 	mux.HandleFunc("POST /api/library/{what}/{action}", func(rw http.ResponseWriter, r *http.Request) {
 		var in struct {
@@ -256,12 +430,22 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 			Agents []string `json:"agents"`
 			Source string
 			Paths  []string
-			Names  []string // the skills to update, of those a check found changed
+			Names  []string // the skills to update, of those a check found changed; to bring in, of those found in the agents
 			Server library.Server
-			ID     string            // a market server's, or a market skill's in its repository
-			Values map[string]string // what a market server needs
-			Dir    string            // a project's folder
-			Copy   bool              // a project gets copies, not links
+			Hook   library.Hook // a hook saved (#1790)
+			// a subagent saved (#2283)
+			Subagent library.Subagent
+			Agent    string            // the agent whose own skill is in the library's way
+			ID       string            // a market server's, or a market skill's in its repository
+			Values   map[string]string // what a market server needs
+			Dir      string            // a project's folder
+			Copy     bool              // a project gets copies, not links
+			Keep     bool              // a project removed keeps what magpie put in it
+			On       bool              // every skill or server given to the agents, or taken from them
+			How      string            // link or copy: how skills are given to Agent, or to every agent with none (#896)
+			// Replace updates a skill changed here all the same, its
+			// changed version kept with the backups (#1449)
+			Replace bool
 			library.InstructionsChange
 		}
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
@@ -281,24 +465,84 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 			res, err = library.SaveServer(in.Old, in.Server)
 		case "servers/agents":
 			res, err = library.ServerAgents(in.Name, in.Agents)
+		case "servers/tools":
+			// the tools its agents leave out (nf1qaz2w on Discord)
+			res, err = library.ServerTools(in.Name, in.Names)
+		case "servers/agents-all":
+			res, err = library.EveryServerAgents(in.Agents, in.On)
+		case "servers/agents-some":
+			res, err = library.SomeServersAgents(in.Names, in.Agents, in.On)
 		case "servers/remove":
 			res, err = library.RemoveServer(in.Name)
+		case "servers/remove-all":
+			res, err = library.RemoveServers(in.Names)
 		case "servers/import":
 			res, err = library.ImportServer(in.Name)
+		case "servers/remove-found":
+			res, err = library.RemoveFoundServer(in.Name)
+		case "hooks/save":
+			res, err = library.SaveHook(in.Old, in.Hook)
+		case "hooks/agents":
+			res, err = library.HookAgents(in.Name, in.Agents)
+		case "hooks/agents-some":
+			res, err = library.SomeHooksAgents(in.Names, in.Agents, in.On)
+		case "hooks/remove":
+			res, err = library.RemoveHooks([]string{in.Name})
+		case "hooks/remove-all":
+			res, err = library.RemoveHooks(in.Names)
+		case "subagents/save":
+			res, err = library.SaveSubagent(in.Old, in.Subagent)
+		case "subagents/agents":
+			res, err = library.SubagentAgentsSet(in.Name, in.Agents)
+		case "subagents/remove":
+			res, err = library.RemoveSubagents([]string{in.Name})
 		case "skills/install":
 			res, err = library.InstallSkills(in.Source, in.Paths, in.Agents)
 		case "skills/update":
-			res, err = library.UpdateSkill(in.Name)
+			res, err = library.UpdateSkill(in.Name, in.Replace)
+			var gone *library.GoneError
+			if errors.As(err, &gone) {
+				// removed from its source: the page shows it so, not a failure
+				res, err = &library.Result{Changed: []string{}, Problems: []library.Problem{}, Gone: []string{gone.Name}}, nil
+			}
+		case "skills/remove-gone":
+			res, err = library.RemoveGoneSkills(in.Names)
 		case "skills/update-all":
 			res, err = library.UpdateSkills()
 		case "skills/update-some":
 			res, err = library.UpdateSomeSkills(in.Names)
 		case "skills/agents":
 			res, err = library.SkillAgents(in.Name, in.Agents)
+		case "skills/agents-all":
+			res, err = library.EverySkillAgents(in.Agents, in.On)
+		case "skills/agents-some":
+			res, err = library.SomeSkillsAgents(in.Names, in.Agents, in.On)
 		case "skills/remove":
 			res, err = library.RemoveSkill(in.Name)
+		case "skills/remove-all":
+			res, err = library.RemoveSkills(in.Names)
+		case "skills/group":
+			res, err = library.GroupSkills(in.Old, in.Name, in.Names)
+		case "skills/ungroup":
+			res, err = library.UngroupSkills(in.Name, in.Names)
+		case "skills/add-new":
+			res, err = library.AddNewSkills(in.Names)
+		case "skills/ignore-new":
+			err = library.IgnoreNewSkills(in.Names)
 		case "skills/import":
 			res, err = library.ImportSkill(in.Name)
+		case "skills/import-all":
+			res, err = library.ImportSkills(in.Names)
+		case "skills/remove-found":
+			res, err = library.RemoveFoundSkill(in.Name)
+		case "skills/remove-found-some":
+			res, err = library.RemoveFoundSkills(in.Names)
+		case "skills/use-library":
+			res, err = library.UseLibrarySkills(oneOrMore(in.Name, in.Names), in.Agent)
+		case "skills/how":
+			res, err = library.SetSkillHow(in.Agent, in.How)
+		case "skills/keep-own":
+			res, err = library.KeepAgentSkills(oneOrMore(in.Name, in.Names), in.Agent)
 		case "market/server":
 			res, err = library.InstallServer(in.ID, in.Values, in.Agents)
 		case "market/skill":
@@ -306,9 +550,11 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 		case "projects/add":
 			res, err = library.AddProject(in.Dir)
 		case "projects/remove":
-			res, err = library.RemoveProject(in.Dir)
+			res, err = library.RemoveProject(in.Dir, in.Keep)
 		case "projects/skill":
 			res, err = library.ProjectSkill(in.Dir, in.Name, in.Agents)
+		case "projects/server":
+			res, err = library.ProjectServer(in.Dir, in.Name, in.Agents)
 		case "projects/copy":
 			res, err = library.ProjectCopy(in.Dir, in.Copy)
 		case "all/sync":
@@ -321,6 +567,15 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 			fail(rw, err)
 			return
 		}
+		if r.PathValue("what") == "instructions" {
+			v, err := instructionsView(res)
+			if err != nil {
+				fail(rw, err)
+				return
+			}
+			writeJSON(rw, v)
+			return
+		}
 		v, err := libraryView(res)
 		if err != nil {
 			fail(rw, err)
@@ -328,4 +583,13 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 		}
 		writeJSON(rw, v)
 	})
+}
+
+// oneOrMore is the skills an agent's own are settled for: the several the
+// Library's warning sends for one agent together (#1896), or the one.
+func oneOrMore(name string, names []string) []string {
+	if len(names) > 0 {
+		return names
+	}
+	return []string{name}
 }

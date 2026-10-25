@@ -199,6 +199,8 @@ func skillsSh(t *testing.T) *atomic.Int64 {
 
 func TestSkillsShPages(t *testing.T) {
 	sandbox(t)
+	// the cache kept on disk, in what Windows keeps caches in (blank in a sandbox)
+	t.Setenv("LOCALAPPDATA", t.TempDir())
 	hits := skillsSh(t)
 	list, err := fetchPopular()
 	if err != nil || len(list) != 1 || list[0].Source != "o/r" || list[0].SkillID != "pdf" || list[0].Installs != 9 {
@@ -216,6 +218,40 @@ func TestSkillsShPages(t *testing.T) {
 	abouts.Unlock()
 	if got := SkillsAbout([]string{"o/r/pdf"}); got["o/r/pdf"] != "Reads & fills PDFs" || hits.Load() != n {
 		t.Fatalf("kept: %v, %d fetches", got, hits.Load()-n)
+	}
+}
+
+// magpie's own skills come first, marked official, and only where a
+// search names them (ttmouse on X).
+func TestFeaturedSkills(t *testing.T) {
+	sandbox(t)
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	skillsSh(t)
+	popular.Lock()
+	popular.list = nil
+	popular.Unlock()
+	t.Cleanup(func() { popular.Lock(); popular.list = nil; popular.Unlock() })
+
+	list, _ := MarketSkills("")
+	if len(list) != 3 || list[0].ID != "magpie-community/plugins/magpie-setup" || list[1].ID != "magpie-community/plugins/magpie-quota" || list[2].ID != "o/r/pdf" {
+		t.Fatalf("market: %+v", list)
+	}
+	for _, m := range list[:2] {
+		if !m.Official || !m.Featured || m.Description == "" || m.Icon != gh("magpie-community") || !offered(m.Icon) {
+			t.Fatalf("magpie's own: %+v", m)
+		}
+	}
+	if list, _ := MarketSkills("quota"); len(list) == 0 || list[0].SkillID != "magpie-quota" || slices.ContainsFunc(list, func(m MarketSkill) bool { return m.SkillID == "magpie-setup" }) {
+		t.Fatalf("quota: %+v", list)
+	}
+	// Leyuu_5 on X: an agent sets magpie up; found by what a user searches
+	for _, q := range []string{"setup", "routing", "gateway key"} {
+		if list, _ := MarketSkills(q); len(list) == 0 || list[0].SkillID != "magpie-setup" {
+			t.Fatalf("%s: %+v", q, list)
+		}
+	}
+	if list, _ := MarketSkills("pdf"); slices.ContainsFunc(list, func(m MarketSkill) bool { return m.Featured }) {
+		t.Fatalf("pdf: %+v", list)
 	}
 }
 
@@ -301,5 +337,36 @@ func TestMagpieImageIsOptIn(t *testing.T) {
 	s := l.server("magpie-image")
 	if s == nil || len(s.Agents) != 0 || !filepath.IsAbs(s.Command) || strings.Join(s.Args, " ") != "mcp image" {
 		t.Fatalf("added as %+v", s)
+	}
+}
+
+// Magpie Image's card doesn't say videos need a Grok subscription: the
+// gateway also makes them with Seedance, another magpie and a provider whose
+// model list marks video models (#1399).
+func TestMagpieImageSaysVideoModels(t *testing.T) {
+	d := selfServer().Description
+	if strings.Contains(d, "Grok subscription") || !strings.Contains(d, "video model set up in Magpie") {
+		t.Fatalf("description %q", d)
+	}
+}
+
+// A skill taken in from an agent's folder has no GitHub source, and adding
+// it from the market is turned away by its name; the market says it's had
+// by the same name (#444).
+func TestMarketSkillHadByName(t *testing.T) {
+	l := &Library{Skills: []*Skill{
+		{Name: "tdd", Source: &Source{Kind: "folder", Dir: "/home/u/.agents/skills/tdd"}},
+		{Name: "grill-me"},
+		{Name: "pdf", Source: &Source{Kind: "github", Repo: "anthropics/skills", Path: "skills/pdf"}},
+	}}
+	for _, c := range []struct{ source, id, name, want string }{
+		{"mattpocock/skills", "tdd", "tdd", "tdd"},
+		{"mattpocock/skills", "grill-me", "Grill Me", "grill-me"},
+		{"anthropics/skills", "pdf", "pdf", "pdf"},
+		{"anthropics/skills", "docx", "docx", ""},
+	} {
+		if got := l.haveSkill(c.source, c.id, c.name); got != c.want {
+			t.Errorf("haveSkill(%s, %s) = %q, want %q", c.source, c.id, got, c.want)
+		}
 	}
 }

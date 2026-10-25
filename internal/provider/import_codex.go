@@ -6,15 +6,12 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/yetone/magpie/internal/appdir"
 )
 
 func codexConfigPath() string {
-	dir := os.Getenv("CODEX_HOME")
-	if dir == "" {
-		home, _ := os.UserHomeDir()
-		dir = filepath.Join(home, ".codex")
-	}
-	return filepath.Join(dir, "config.toml")
+	return filepath.Join(appdir.CodexHome(), "config.toml")
 }
 
 func readCodexConfig(path string) ([]AppImport, error) {
@@ -115,7 +112,7 @@ func codexImportModels(configPath, catalogPath string) []string {
 	} else if !filepath.IsAbs(catalogPath) {
 		catalogPath = filepath.Join(filepath.Dir(configPath), catalogPath)
 	}
-	if filepath.Clean(catalogPath) == filepath.Join(home, ".codex", "magpie-models.json") {
+	if filepath.Clean(catalogPath) == filepath.Join(appdir.CodexHomeIn(home), "magpie-models.json") {
 		return nil
 	}
 	b, err := os.ReadFile(catalogPath)

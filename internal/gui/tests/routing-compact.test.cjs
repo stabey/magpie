@@ -35,7 +35,7 @@ const route = {
 
 const words = {
   en: { cond: "compacting", story: "The agent is compacting the conversation, so rule 1 sends the summary to", small: "Passed over, as the conversation is longer than they take: c/mini.", skip: "longer conversations skip it: it takes 128,000 tokens", edit: "Edit", add: "Add a rule", save: "Save" },
-  zh: { cond: "压缩上下文时", story: "Agent 正在压缩上下文，规则 1 把这次总结交给", small: "对话比它们的上下文长，已跳过：c/mini。", skip: "更长的对话会跳过它：它的上下文只有 128,000 tokens", edit: "编辑", add: "添加规则", save: "保存" },
+  zh: { cond: "压缩上下文时", story: "Agent 正在压缩上下文，规则 1 将总结交给", small: "对话比它们的上下文长，已跳过：c/mini。", skip: "更长的对话会跳过它：它的上下文只有 128,000 tokens", edit: "编辑", add: "添加规则", save: "保存" },
 };
 
 function serve(lang, posts) {
@@ -101,9 +101,27 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await rows.first().locator(".rt-rwarn").textContent(), w.skip);
 
       // a second rule, compacting alone: toggled with nothing moved
-      await ed.locator("button", { hasText: w.add }).click();
+      // (wheeled down to, as the reader would: the editor runs past the
+      // window and the page keeps still for any other scroll)
+      const add = ed.locator("button", { hasText: w.add });
+      await page.mouse.move(550, 600);
+      for (let i = 0; i < 10 && (await add.boundingBox()).y > 1400 - 160; i++) {
+        await page.mouse.wheel(0, 300);
+        await page.waitForTimeout(150);
+      }
+      const ab = await add.boundingBox();
+      await page.mouse.click(ab.x + ab.width / 2, ab.y + ab.height / 2);
+      // a new rule asks for an intent: taken off with its ×, and
+      // compacting added from the rule's + menu instead
+      await rows.nth(1).locator('.rt-c[data-k="intent"]').hover();
+      await rows.nth(1).locator('.rt-c[data-k="intent"] .rt-cx').click();
+      await rows.nth(1).locator(".rt-addc").click();
+      await page.locator(".proto-menu .pm-item", { hasText: w.cond }).click();
       const second = rows.nth(1).locator("button.rt-cond", { hasText: w.cond });
       await second.waitFor();
+      assert.equal(await second.getAttribute("class"), "rt-cond on", "added as set");
+      await second.click();
+      assert.equal(await second.getAttribute("class"), "rt-cond");
       const at = () => page.evaluate(() => [...document.querySelectorAll("*")].filter((e) => e.scrollTop).map((e) => [e.id || e.className, e.scrollTop]).join(";") + "|" + Math.round(document.querySelector(".rt-gedit").getBoundingClientRect().top));
       await second.scrollIntoViewIfNeeded(); // by the test, as the reader would
       await page.waitForTimeout(200);
@@ -121,8 +139,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // other scroll, and the mouse where it is: the browsers' scroll
       // into view before a click can leave it under the footer)
       await page.mouse.move(550, 600);
-      await page.mouse.wheel(0, 600);
-      await page.waitForTimeout(300);
+      for (let i = 0; i < 10 && (await saveBtn.boundingBox()).y > 1400 - 160; i++) {
+        await page.mouse.wheel(0, 300);
+        await page.waitForTimeout(150);
+      }
       const sb = await saveBtn.boundingBox();
       await page.mouse.click(sb.x + sb.width / 2, sb.y + sb.height / 2);
       await page.waitForFunction(() => !document.querySelector(".rt-gedit"));

@@ -7,6 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +23,7 @@ import (
 // chatgpt stands in for the ChatGPT backend behind CodexBase.
 func chatgpt(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir()) // no sign-ins but the test's
+	setHome(t, t.TempDir()) // no sign-ins but the test's
 	up := httptest.NewServer(h)
 	t.Cleanup(up.Close)
 	was := provider.CodexBase
@@ -62,7 +65,7 @@ func TestCodexOwnModelPassesThrough(t *testing.T) {
 	if code != 200 || !strings.Contains(body, `"input_tokens":9`) {
 		t.Fatalf("%d %s", code, body)
 	}
-	if u := usage.Load(time.Time{}); len(u) != 1 || u[0].Input != 9 || u[0].Output != 2 || u[0].Provider != "openai" {
+	if u := usage.Load(time.Time{}); len(u) != 1 || u[0].Input != 9 || u[0].Output != 2 || u[0].Provider != "openai" || u[0].ResponseID != "r1" {
 		t.Errorf("usage %+v", u)
 	}
 	if path != "/backend-api/codex/responses" || head.Get("Authorization") != "Bearer chatgpt-token" || head.Get("chatgpt-account-id") != "acct-1" {
@@ -78,6 +81,174 @@ func TestCodexOwnModelPassesThrough(t *testing.T) {
 	}
 }
 
+// codexChatGPTAuth signs this test's Codex in to a synthetic ChatGPT
+// account. CODEX_HOME is the only auth.json it reads.
+func codexChatGPTAuth(t *testing.T, email string) {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "codex-home")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", dir)
+	claims, err := json.Marshal(map[string]any{"email": email})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp, err := json.Marshal(map[string]any{"exp": time.Now().Add(time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := func(payload []byte) string {
+		return "h." + base64.RawURLEncoding.EncodeToString(payload) + ".s"
+	}
+	auth, err := json.Marshal(map[string]any{
+		"auth_mode": "chatgpt",
+		"tokens": map[string]string{
+			"id_token":      token(claims),
+			"access_token":  token(exp),
+			"refresh_token": "rt-synthetic",
+			"account_id":    "acct-synthetic",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), auth, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	provider.ForgetAccounts()
+	t.Cleanup(provider.ForgetAccounts)
+}
+
+// A turn relayed on Codex's own ChatGPT sign-in is that codex account's
+// in the ledger. Recorded as openai with no account, the card's window
+// (keyed codex + the email) never sees it. The Routing view still calls
+// the seat openai, and the row is still not a lead's answerer (#1367).
+func TestCodexOwnModelRecordedAsCodexAccount(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	chatgpt(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, sse(`data: {"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":9,"output_tokens":2}}}`))
+	})
+	codexChatGPTAuth(t, "me@example.com")
+	s := New()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", CodexPath+"/responses", strings.NewReader(`{"model":"gpt-5.5","stream":true,"input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer chatgpt-token")
+	req.Header.Set("session_id", "lead-own")
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	u := usage.Load(time.Time{})
+	if len(u) != 1 || u[0].Provider != "codex" || u[0].ProviderAccount != "me@example.com" || u[0].Input != 9 || u[0].Output != 2 {
+		t.Fatalf("usage %+v", u)
+	}
+	if strings.Contains(u[0].Host, " as ") {
+		t.Fatalf("relay host names an account, so it would count as a routed answer: %q", u[0].Host)
+	}
+	if a := loggedAnswers("lead-own"); len(a) != 0 {
+		t.Fatalf("own sign-in answered a lead: %+v", a)
+	}
+	st := s.Trace(t.Context(), 0, 0)
+	if len(st.Routes) != 1 || len(st.Routes[0].Usage) != 1 || st.Routes[0].Usage[0].Provider != "openai" {
+		t.Fatalf("routing view %+v", st.Routes)
+	}
+}
+
+// An API-key call stays openai with no account, even while a ChatGPT
+// sign-in is on disk: that spend is not the subscription card's.
+func TestCodexAPIKeyRecordedAsOpenAI(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, sse(`data: {"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":4,"output_tokens":1}}}`))
+	}))
+	t.Cleanup(up.Close)
+	was := codexAPIBase
+	codexAPIBase = up.URL + "/v1"
+	t.Cleanup(func() { codexAPIBase = was })
+	codexChatGPTAuth(t, "me@example.com")
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", CodexPath+"/responses", strings.NewReader(`{"model":"gpt-5.5","stream":true,"input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer sk-synthetic")
+	New().Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	u := usage.Load(time.Time{})
+	if len(u) != 1 || u[0].Provider != "openai" || u[0].ProviderAccount != "" || u[0].Input != 4 {
+		t.Fatalf("usage %+v", u)
+	}
+}
+
+// A compaction signed by another account is that account's, not the
+// sign-in the request would have relayed on. A request naming another
+// ChatGPT account than the sign-in magpie reads (a Codex in WSL, or
+// under another CODEX_HOME) is not put on that sign-in, and with no
+// sign-in to name it stays openai, so no row is half a codex account.
+func TestCodexServedNamesTheAccountThatSigned(t *testing.T) {
+	on := &provider.Provider{ID: "codex", Account: &provider.Account{Agent: "codex", User: "spare@example.com"}}
+	id, acct := codexServed(provider.CodexBase, http.Header{}, on)
+	if id != "codex" || acct != "spare@example.com" {
+		t.Fatalf("stand-in: %s %s", id, acct)
+	}
+	setHome(t, t.TempDir())
+	codexChatGPTAuth(t, "me@example.com")
+	h := http.Header{}
+	h.Set("chatgpt-account-id", "acct-synthetic")
+	if id, acct = codexServed(provider.CodexBase, h, nil); id != "codex" || acct != "me@example.com" {
+		t.Fatalf("its own account: %s %s", id, acct)
+	}
+	h.Set("chatgpt-account-id", "acct-elsewhere")
+	if id, acct = codexServed(provider.CodexBase, h, nil); id != "openai" || acct != "" {
+		t.Fatalf("another account's token: %s %s", id, acct)
+	}
+	t.Setenv("CODEX_HOME", t.TempDir())
+	provider.ForgetAccounts()
+	if id, acct = codexServed(provider.CodexBase, http.Header{}, nil); id != "openai" || acct != "" {
+		t.Fatalf("no sign-in: %s %s", id, acct)
+	}
+}
+
+// Codex's own sign-in relay is not a lead's answerer, under the name it
+// was logged by before (openai) or the codex account it is logged by now.
+// A row an account answered — host "as email", or another provider, or
+// /v1 — still is. One codex row is not counted twice.
+func TestCodexOwnRelayAnswersNoLead(t *testing.T) {
+	setHome(t, t.TempDir())
+	// usage.Path follows the first home a process reads; -count keeps
+	// writing there, so each run's sessions are its own.
+	stamp := strconv.FormatInt(time.Now().UnixNano(), 10)
+	now := time.Now()
+	row := func(name, prov, account, host, endpoint string) string {
+		t.Helper()
+		session := name + "-" + stamp
+		usage.Append(usage.Record{
+			Time: now, Agent: "codex", Provider: prov, Host: host, ProviderAccount: account,
+			Model: "gpt-5.5", Input: 9, Output: 2, Status: 200, Endpoint: endpoint, Session: session,
+		})
+		return session
+	}
+	relay := row("lead-relay", "openai", "", provider.HostOf(provider.CodexBase), CodexPath+"/responses")
+	row("lead-relay", "codex", "me@example.com", provider.HostOf(provider.CodexBase), CodexPath+"/responses")
+	if a := loggedAnswers(relay); len(a) != 0 {
+		t.Fatalf("own sign-in answered a lead: %+v", a)
+	}
+	routed := row("lead-routed", "codex", "me@example.com", "chatgpt.com as me@example.com", CodexPath+"/responses")
+	if a := loggedAnswers(routed); len(a) != 1 || a[0].provider != "codex" || a[0].who != "codex@me@example.com" {
+		t.Fatalf("routed account: %+v", a)
+	}
+	v1 := row("lead-v1", "codex", "me@example.com", "chatgpt.com as me@example.com", "/v1/responses")
+	if a := loggedAnswers(v1); len(a) != 1 || a[0].who != "codex@me@example.com" {
+		t.Fatalf("/v1 account: %+v", a)
+	}
+	other := row("lead-other", "sub2api", "", "relay.example.com", CodexPath+"/responses")
+	if a := loggedAnswers(other); len(a) != 1 || a[0].provider != "sub2api" {
+		t.Fatalf("relay: %+v", a)
+	}
+}
+
 // A turn on one of Codex's own models shows in the Routing view's live
 // trace, as those on magpie's do.
 func TestCodexOwnModelTraced(t *testing.T) {
@@ -90,18 +261,26 @@ func TestCodexOwnModelTraced(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", CodexPath+"/responses", strings.NewReader(`{"model":"gpt-5.5","stream":true,"input":"hi"}`))
 	req.Header.Set("Authorization", "Bearer chatgpt-token")
+	req.Header.Set("session_id", "codex-conversation")
+	req.Header.Set("x-codex-turn-metadata", `{"thread_source":"thread_title","forked_from_thread_id":"main-conversation"}`)
 	s.Handler().ServeHTTP(rec, req)
 	st := s.Trace(t.Context(), 0, 0)
 	if len(st.Routes) != 1 {
 		t.Fatalf("routes %+v", st.Routes)
 	}
 	r := st.Routes[0]
+	if r.Session != "codex-conversation" || r.ParentSession != "main-conversation" || r.Kind != "thread_title" || len(r.Usage) != 1 || r.Usage[0].Provider != "openai" || r.Usage[0].Input != 9 || r.Usage[0].Output != 2 {
+		t.Fatalf("session accounting: %+v", r)
+	}
 	if !r.Done || r.Status != 200 || r.Model != "gpt-5.5" || r.Tokens != 11 ||
 		len(r.Order) != 1 || r.Order[0].Who != "Codex's own sign-in" || len(r.Tries) != 1 || !r.Tries[0].Done || r.Tries[0].Status != 200 {
 		t.Errorf("route %+v", r)
 	}
 	if st.Totals.Requests != 1 {
 		t.Errorf("totals %+v", st.Totals)
+	}
+	if recs := usage.Load(time.Time{}); len(recs) != 1 || recs[0].RouteID != r.ID || r.ID == 0 {
+		t.Fatalf("usage: %+v, route %d", recs, r.ID)
 	}
 }
 
@@ -395,6 +574,186 @@ func TestCodexModelListNarrowedByPicks(t *testing.T) {
 	}
 }
 
+// The picks narrow only the models a picker shows. A hidden entry of the
+// backend's, such as codex-auto-review, isn't one: no picker lists it, and
+// Codex's auto-review runs on it when the list has it. Taken out, the review
+// fell back to the conversation's model at low effort, which a relay model
+// charged to the relay (#1460).
+func TestCodexModelListPicksKeepHidden(t *testing.T) {
+	codexSignedIn(t)
+	if err := provider.Save(provider.Provider{ID: "codex", Models: []string{"gpt-6-sol"}}); err != nil {
+		t.Fatal(err)
+	}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"models":[{"slug":"gpt-6-sol","priority":1,"visibility":"list"},{"slug":"gpt-5.5","priority":2,"visibility":"list"},{"slug":"codex-auto-review","priority":3,"visibility":"hide"}]}`)
+	}))
+	defer up.Close()
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	defer func() { provider.CodexBase = was }()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", CodexPath+"/models", nil)
+	req.Header.Set("Authorization", "Bearer chatgpt-token")
+	New().Handler().ServeHTTP(rec, req)
+	var list struct {
+		Models []map[string]any `json:"models"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &list)
+	got := map[string]bool{}
+	for _, m := range list.Models {
+		slug, _ := m["slug"].(string)
+		got[slug] = true
+	}
+	if rec.Code != 200 || !got["gpt-6-sol"] || got["gpt-5.5"] || !got["codex-auto-review"] {
+		t.Errorf("after picks: %v (want gpt-6-sol and codex-auto-review, not gpt-5.5); code %d", got, rec.Code)
+	}
+}
+
+// A native model taken out of Codex's list on the Agents page is dropped
+// from the backend's list too, and the ETag changes so Codex asks again.
+func TestCodexModelListHidesOnAgentsPage(t *testing.T) {
+	codexSignedIn(t)
+	if err := provider.Save(provider.Provider{ID: "codex", Models: []string{"gpt-5.5", "gpt-5-codex"}}); err != nil {
+		t.Fatal(err)
+	}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		io.WriteString(w, `{"models":[{"slug":"gpt-5.5","priority":1},{"slug":"gpt-5-codex","priority":2}]}`)
+	}))
+	defer up.Close()
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	defer func() { provider.CodexBase = was }()
+	list := func() ([]string, string) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", CodexPath+"/models", nil)
+		req.Header.Set("Authorization", "Bearer chatgpt-token")
+		New().Handler().ServeHTTP(rec, req)
+		var got struct {
+			Models []map[string]any `json:"models"`
+		}
+		json.Unmarshal(rec.Body.Bytes(), &got)
+		var native []string
+		for _, m := range got.Models {
+			if slug, _ := m["slug"].(string); strings.HasPrefix(slug, "gpt-") {
+				native = append(native, slug)
+			}
+		}
+		return native, rec.Header().Get("ETag")
+	}
+	all, before := list()
+	if len(all) != 2 {
+		t.Fatalf("native models %v", all)
+	}
+	var id string
+	for _, e := range provider.Catalog() {
+		if acc := e.Provider.Account; acc != nil && acc.Agent == "codex" && e.Model == "gpt-5-codex" {
+			id = e.ID
+		}
+	}
+	if id == "" {
+		t.Fatal("no catalog entry for the account's gpt-5-codex")
+	}
+	if err := provider.SetHiddenModels("codex", []string{id}); err != nil {
+		t.Fatal(err)
+	}
+	native, after := list()
+	if len(native) != 1 || native[0] != "gpt-5.5" || after == before {
+		t.Errorf("native %v, ETag %q then %q", native, before, after)
+	}
+}
+
+// The codex provider set to "Only through routing groups" keeps the
+// ChatGPT account's own models out of Codex's list, as it keeps them out of
+// every other agent's: Codex was handed all seven the backend listed, and
+// with none of them in magpie's lists, the Agents page had no Codex group
+// to hide (#1602). Its hidden ones (codex-auto-review) stay, and the ETag
+// changes so Codex asks again. A group that keeps its members out of the
+// lists (Group.Unlists) takes just those.
+func TestCodexModelListUnlistedForGroups(t *testing.T) {
+	codexSignedIn(t)
+	if err := provider.Save(provider.Provider{ID: "codex", Models: []string{"gpt-6-sol", "gpt-5.5"}}); err != nil {
+		t.Fatal(err)
+	}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		io.WriteString(w, `{"models":[{"slug":"gpt-6-sol","priority":1,"visibility":"list"},{"slug":"gpt-5.5","priority":2,"visibility":"list"},{"slug":"codex-auto-review","priority":3,"visibility":"hide"}]}`)
+	}))
+	defer up.Close()
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	defer func() { provider.CodexBase = was }()
+	list := func() (map[string]bool, string) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", CodexPath+"/models", nil)
+		req.Header.Set("Authorization", "Bearer chatgpt-token")
+		New().Handler().ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("%d %s", rec.Code, rec.Body)
+		}
+		var got struct {
+			Models []map[string]any `json:"models"`
+		}
+		json.Unmarshal(rec.Body.Bytes(), &got)
+		out := map[string]bool{}
+		for _, m := range got.Models {
+			slug, _ := m["slug"].(string)
+			out[slug] = true
+		}
+		return out, rec.Header().Get("ETag")
+	}
+	got, before := list()
+	if !got["gpt-6-sol"] || !got["gpt-5.5"] || !got["codex-auto-review"] {
+		t.Fatalf("listed: %v", got)
+	}
+	var id string
+	for _, e := range provider.Catalog() {
+		if provider.CodexOwn(e) && e.Model == "gpt-5.5" {
+			id = e.ID
+		}
+	}
+	if id == "" {
+		t.Fatal("no catalog entry for the account's gpt-5.5")
+	}
+
+	// a group keeping its members out of the lists takes gpt-5.5 alone
+	if err := provider.SaveGroup(provider.Group{ID: "mine", Name: "Mine", Members: []string{id}, Unlists: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, grouped := list()
+	if !got["gpt-6-sol"] || got["gpt-5.5"] || !got["codex-auto-review"] || grouped == before {
+		t.Errorf("group unlisting gpt-5.5: %v, ETag %q then %q", got, before, grouped)
+	}
+
+	// the provider only through routing groups takes every one
+	if err := provider.Save(provider.Provider{ID: "codex", Models: []string{"gpt-6-sol", "gpt-5.5"}, Unlisted: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, after := list()
+	if got["gpt-6-sol"] || got["gpt-5.5"] || !got["codex-auto-review"] || after == grouped {
+		t.Errorf("only through routing groups: %v (want codex-auto-review alone of the account's), ETag %q then %q", got, grouped, after)
+	}
+
+	// and spawn_agent names none of them to a lead, as Codex's list
+	// doesn't: from models_cache.json, which Codex wrote from a list before
+	os.WriteFile(filepath.Join(os.Getenv("HOME"), ".codex", "models_cache.json"), []byte(`{"etag":"\"v1\"","models":[{"slug":"gpt-6-sol","visibility":"list","priority":1},{"slug":"gpt-5.5","visibility":"list","priority":2}]}`), 0o600)
+	for _, c := range spawnChoices(httptest.NewRequest("POST", CodexPath+"/responses", nil), "group/mine", true) {
+		if c.slug == "gpt-6-sol" || c.slug == "gpt-5.5" {
+			t.Errorf("spawn_agent offers %s", c.slug)
+		}
+	}
+
+	// a Codex here for account failover alone is handed no groups, and
+	// keeps its own
+	was2 := CodexOwnOnly
+	CodexOwnOnly = func() bool { return true }
+	defer func() { CodexOwnOnly = was2 }()
+	if got, _ := list(); !got["gpt-6-sol"] || !got["gpt-5.5"] {
+		t.Errorf("own only: %v", got)
+	}
+}
+
 // A reply's X-Models-Etag carries magpie's list too: Codex refetches its
 // model list on a new one, and only on the backend's it never would when a
 // provider was added.
@@ -585,5 +944,218 @@ func TestCodexThirdPartyCompactEndpointRejected(t *testing.T) {
 	code, body := post(t, CodexPath+"/responses/compact", `{"model":"fake/m1","input":[]}`)
 	if code != 400 || !strings.Contains(body, "not supported") || f.calls != 0 {
 		t.Fatalf("%d %s, calls %d", code, body, f.calls)
+	}
+}
+
+func TestCodexBackendKeepsNativeSession(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	chatgpt(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, sse(`data: {"type":"response.completed","response":{"usage":{"input_tokens":9,"output_tokens":2}}}`))
+	})
+	req := httptest.NewRequest("POST", CodexPath+"/responses", strings.NewReader(`{"model":"gpt-5.5","stream":true,"input":[]}`))
+	req.Header.Set("Authorization", "Bearer chatgpt-token")
+	req.Header.Set("Session_id", "native-thread")
+	req.Header.Set(SessionHeader, "routing-override")
+	rec := httptest.NewRecorder()
+	New().Handler().ServeHTTP(rec, req)
+	rs := usage.Load(time.Time{})
+	if len(rs) != 1 || rs[0].NativeSession != "native-thread" || rs[0].Session != "routing-override" {
+		t.Fatalf("lost native session: %+v", rs)
+	}
+}
+
+// A codex provider switched off narrows nothing: it serves no agent
+// anything, so the account's own list is left whole, its picks kept for
+// when it is switched on again.
+func TestCodexModelListNotNarrowedWhileOff(t *testing.T) {
+	codexSignedIn(t)
+	if err := provider.Save(provider.Provider{ID: "codex", Models: []string{"gpt-6-sol"}, Off: true}); err != nil {
+		t.Fatal(err)
+	}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"models":[{"slug":"gpt-6-sol","priority":1},{"slug":"gpt-5.5","priority":2}]}`)
+	}))
+	defer up.Close()
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	defer func() { provider.CodexBase = was }()
+
+	native := func() []string {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", CodexPath+"/models", nil)
+		req.Header.Set("Authorization", "Bearer chatgpt-token")
+		New().Handler().ServeHTTP(rec, req)
+		var list struct {
+			Models []map[string]any `json:"models"`
+		}
+		json.Unmarshal(rec.Body.Bytes(), &list)
+		var out []string
+		for _, m := range list.Models {
+			slug, _ := m["slug"].(string)
+			if strings.HasPrefix(slug, "gpt-") {
+				out = append(out, slug)
+			}
+		}
+		return out
+	}
+	if got := native(); len(got) != 2 {
+		t.Errorf("switched off, the account's own models = %v (want both kept whole)", got)
+	}
+	if err := provider.SetOff("codex", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := native(); len(got) != 1 || got[0] != "gpt-6-sol" {
+		t.Errorf("switched on, the picks narrow again = %v (want just gpt-6-sol)", got)
+	}
+}
+
+// Body-only title metadata and ordinary Luna Reserve turns have the same kind
+// in the native Codex trace, request log and usage ledger.
+func TestCodexOwnModelKindAccounting(t *testing.T) {
+	for _, tc := range []struct{ name, metadata, reserve, kind, parent string }{
+		{"reserve", `{"thread_source":"user"}`, "1", "luna_reserve", ""},
+		{"body title", `{"thread_source":"thread_title","parent_thread_id":"main"}`, "", "thread_title", "main"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setup(t, provider.Chat, &fake{t: t})
+			chatgpt(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				io.WriteString(w, sse(`data: {"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":9,"output_tokens":2}}}`))
+			})
+			body, _ := json.Marshal(map[string]any{"model": "gpt-5.5", "stream": true, "input": "hi",
+				"client_metadata": map[string]string{"x-codex-turn-metadata": tc.metadata}})
+			s := New()
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", CodexPath+"/responses", bytes.NewReader(body))
+			req.Header.Set("Authorization", "Bearer test-token")
+			req.Header.Set("session_id", "child")
+			req.Header.Set("x-openai-codex-luna-reserve", tc.reserve)
+			s.Handler().ServeHTTP(rec, req)
+			if rec.Code != 200 {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+			}
+			routes := s.Trace(t.Context(), 0, 0).Routes
+			if len(routes) != 1 || routes[0].Kind != tc.kind || routes[0].ParentSession != tc.parent {
+				t.Fatalf("trace: %+v", routes)
+			}
+			if calls := s.Recent(); len(calls) != 1 || calls[0].Kind != tc.kind {
+				t.Fatalf("request log: %+v", calls)
+			}
+			recs := usage.Load(time.Time{})
+			if len(recs) != 1 || recs[0].Kind != tc.kind {
+				t.Fatalf("usage: %+v", recs)
+			}
+		})
+	}
+}
+
+// A turn on one of Codex's own models logs the reasoning Codex asked for,
+// as the others' turns do: the request log's reasoning column was blank
+// for every one (Karen, #feedback), its body sent zstd as Codex sends it.
+func TestCodexOwnModelLogsEffort(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	var got []byte
+	chatgpt(t, func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		w.Header()["Content-Type"] = nil
+		io.WriteString(w, sse(`data: {"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":9,"output_tokens":2}}}`))
+	})
+	enc, _ := zstd.NewWriter(nil)
+	z := enc.EncodeAll([]byte(`{"model":"gpt-5.5","stream":true,"input":"hi","reasoning":{"effort":"xhigh","summary":"auto"}}`), nil)
+	s := New()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", CodexPath+"/responses", bytes.NewReader(z))
+	req.Header.Set("Content-Encoding", "zstd")
+	req.Header.Set("Authorization", "Bearer chatgpt-token")
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 || !strings.Contains(string(got), `"effort":"xhigh"`) {
+		t.Fatalf("%d %s, sent %s", rec.Code, rec.Body, got)
+	}
+	if u := usage.Load(time.Time{}); len(u) != 1 || u[0].Effort != "xhigh" {
+		t.Errorf("usage %+v", u)
+	}
+	if rs := s.Trace(t.Context(), 0, 0).Routes; len(rs) != 1 || rs[0].Effort != "xhigh" || rs[0].Tries[0].Effort != "xhigh" {
+		t.Errorf("trace %+v", rs)
+	}
+}
+
+// A Codex that reaches magpie for account failover alone, not connected to
+// it, is handed only its own models, and an ETag that is neither the full
+// list's nor contains it, so moving between the two has Codex ask again
+// (#1385: 62 of magpie's models were in its list). Its replies' models ETag
+// carries the same tag.
+func TestCodexModelListOwnOnlyForFailover(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	chatgpt(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			w.Header().Set("ETag", `"v1"`)
+			io.WriteString(w, `{"models":[{"slug":"gpt-5.5","priority":1}]}`)
+			return
+		}
+		w.Header().Set("X-Models-Etag", `W/"v1"`)
+		io.WriteString(w, sse(
+			`data: {"type":"response.created","response":{"id":"r1"}}`,
+			`data: {"type":"response.completed","response":{"id":"r1"}}`))
+	})
+	ownOnly := false
+	was := CodexOwnOnly
+	CodexOwnOnly = func() bool { return ownOnly }
+	t.Cleanup(func() { CodexOwnOnly = was })
+	list := func() ([]string, string) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", CodexPath+"/models", nil)
+		req.Header.Set("Authorization", "Bearer chatgpt-token")
+		New().Handler().ServeHTTP(rec, req)
+		var got struct {
+			Models []map[string]any `json:"models"`
+		}
+		json.Unmarshal(rec.Body.Bytes(), &got)
+		var slugs []string
+		for _, m := range got.Models {
+			slug, _ := m["slug"].(string)
+			slugs = append(slugs, slug)
+		}
+		return slugs, rec.Header().Get("ETag")
+	}
+	full, fullTag := list()
+	if len(full) < 2 || !strings.Contains(strings.Join(full, " "), "fake/m1") {
+		t.Fatalf("connected list %v", full)
+	}
+	ownOnly = true
+	own, ownTag := list()
+	if len(own) != 1 || own[0] != "gpt-5.5" {
+		t.Errorf("failover-only list = %v, want just gpt-5.5", own)
+	}
+	if ownTag == fullTag || ownTag != `"v1+magpie-`+provider.CodexOwnListTag()+`"` ||
+		codexcat.Tagged(ownTag, provider.CodexListTag()) || codexcat.Tagged(fullTag, provider.CodexOwnListTag()) {
+		t.Errorf("ETag own %q, full %q", ownTag, fullTag)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", CodexPath+"/responses", strings.NewReader(`{"model":"gpt-5.5","stream":true,"input":[]}`))
+	req.Header.Set("Authorization", "Bearer chatgpt-token")
+	New().Handler().ServeHTTP(rec, req)
+	if got := rec.Header().Get("X-Models-Etag"); rec.Code != 200 || !codexcat.Tagged(got, provider.CodexOwnListTag()) {
+		t.Errorf("%d X-Models-Etag %q", rec.Code, got)
+	}
+}
+
+// A lead a provider answered before it was renamed was answered by the
+// id it has now, the one its candidates go by (cybercaius).
+func TestRenamedProviderAnsweredItsLead(t *testing.T) {
+	setHome(t, t.TempDir())
+	if err := provider.Save(provider.Provider{ID: "myrelay", Name: "My relay", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"gpt-5.5"}}); err != nil {
+		t.Fatal(err)
+	}
+	session := "lead-renamed-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	usage.Append(usage.Record{
+		Time: time.Now(), Agent: "codex", Provider: "myrelay", Host: "relay.example.com", ProviderKeyID: "fp",
+		Model: "gpt-5.5", Input: 9, Output: 2, Status: 200, Endpoint: CodexPath + "/responses", Session: session,
+	})
+	if err := provider.Rename("myrelay", "newrelay"); err != nil {
+		t.Fatal(err)
+	}
+	if a := loggedAnswers(session); len(a) != 1 || a[0].provider != "newrelay" || a[0].who != "newrelay#fp" {
+		t.Fatalf("answers %+v", a)
 	}
 }

@@ -48,7 +48,7 @@ func fakeCodexResets(t *testing.T, count int, details any) *atomic.Int32 {
 
 func TestCodexResetsCounted(t *testing.T) {
 	home := signIn(t)
-	auth := home + "/.codex/auth.json"
+	dir := home + "/.codex"
 	soon := "2026-10-03T14:30:00Z"
 	later := "2026-11-01T00:00:00Z"
 	for _, c := range []struct {
@@ -64,17 +64,25 @@ func TestCodexResetsCounted(t *testing.T) {
 		{"never expire", 2, map[string]any{"available_count": 2, "credits": []any{
 			map[string]any{"id": "a", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-09-01T00:00:00Z", "expires_at": nil},
 			map[string]any{"id": "b", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-09-02T00:00:00Z"},
-		}}, &ResetCredits{Count: 2}, 1},
+		}}, &ResetCredits{Count: 2, Each: []ResetCard{{}, {}}}, 1},
 		{"soonest of those left", 2, map[string]any{"available_count": 2, "credits": []any{
 			map[string]any{"id": "a", "status": "available", "granted_at": "2026-09-01T00:00:00Z", "expires_at": later},
 			map[string]any{"id": "b", "status": "redeemed", "granted_at": "2026-09-01T00:00:00Z", "expires_at": "2026-09-20T00:00:00Z"},
 			map[string]any{"id": "c", "status": "available", "granted_at": "2026-09-02T00:00:00Z", "expires_at": soon},
 			map[string]any{"id": "d", "status": "available", "granted_at": "2026-09-02T00:00:00Z", "expires_at": nil},
 		}}, &ResetCredits{Count: 2, Until: ptrTime(soon)}, 1},
+		// #960: each one left listed, soonest first, the one that never
+		// runs out last; the redeemed one isn't
+		{"each of those left", 3, map[string]any{"available_count": 3, "credits": []any{
+			map[string]any{"id": "a", "status": "available", "granted_at": "2026-09-01T00:00:00Z", "expires_at": later},
+			map[string]any{"id": "b", "status": "redeemed", "granted_at": "2026-09-01T00:00:00Z", "expires_at": "2026-09-20T00:00:00Z"},
+			map[string]any{"id": "d", "status": "available", "granted_at": "2026-09-02T00:00:00Z", "expires_at": nil},
+			map[string]any{"id": "c", "status": "available", "granted_at": "2026-09-02T00:00:00Z", "expires_at": soon},
+		}}, &ResetCredits{Count: 3, Until: ptrTime(soon), Each: []ResetCard{{Until: ptrTime(soon)}, {Until: ptrTime(later)}, {}}}, 1},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			asked := fakeCodexResets(t, c.count, c.details)
-			q := codexSubscriptionUsage(context.Background(), auth)
+			q := codexSubscriptionUsage(context.Background(), dir)
 			if q.Error != "" || len(q.Windows) != 1 {
 				t.Fatalf("quota %+v", q)
 			}
@@ -97,10 +105,22 @@ func sameResets(a, b *ResetCredits) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
-	if a.Count != b.Count || (a.Until == nil) != (b.Until == nil) {
+	if a.Count != b.Count || !sameTime(a.Until, b.Until) || len(a.Each) != len(b.Each) {
 		return false
 	}
-	return a.Until == nil || a.Until.Equal(*b.Until)
+	for i := range a.Each {
+		if a.Each[i].Window != b.Each[i].Window || !sameTime(a.Each[i].Until, b.Each[i].Until) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameTime(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Equal(*b)
 }
 
 func TestConsumeCodexReset(t *testing.T) {
@@ -196,9 +216,17 @@ func TestUseCodexReset(t *testing.T) {
 	if _, err := UseCodexReset(context.Background(), "nobody@example.com"); err == nil || consumed.Load() != 0 {
 		t.Fatalf("spent on an unknown account: %v", err)
 	}
+	// the menu bar hears the windows started again, and reads them at
+	// once rather than at its next tick (#2357)
+	var told atomic.Int32
+	OnSubscriptionUsage(func() { told.Add(1) })
+	t.Cleanup(func() { OnSubscriptionUsage(nil) })
 	out, err := UseCodexReset(context.Background(), "me@example.com")
 	if err != nil || out.Code != "reset" || out.Windows != 2 || consumed.Load() != 1 {
 		t.Fatalf("%+v %v", out, err)
+	}
+	if told.Load() == 0 {
+		t.Fatal("a reset spent didn't tell the menu bar")
 	}
 	if got := spent.Load(); got != "soon" {
 		t.Fatalf("spent %v, not the one that runs out first", got)

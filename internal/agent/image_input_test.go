@@ -10,11 +10,13 @@ import (
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/codexcat"
 	"github.com/yetone/magpie/internal/provider"
+	"gopkg.in/yaml.v3"
 )
 
 func TestConfiguredModelsAdvertiseImageInput(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	if err := provider.Save(provider.Provider{
@@ -43,14 +45,24 @@ func TestConfiguredModelsAdvertiseImageInput(t *testing.T) {
 		return result
 	}
 
+	// a config magpie wrote before #2209 has attachment on its models;
+	// the next write takes it away
+	ocPath := filepath.Join(home, ".config", "opencode", "opencode.json")
+	if err := os.MkdirAll(filepath.Dir(ocPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ocPath, []byte(`{"provider":{"magpie":{"models":{"vision/image":{"name":"image","attachment":true}}}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := opencode(home, filepath.Join(home, ".config")).Field("model").Set("magpie/vision/image"); err != nil {
 		t.Fatal(err)
 	}
 	oc := read(filepath.Join(home, ".config", "opencode", "opencode.json"))
 	ocModels := oc["provider"].(map[string]any)["magpie"].(map[string]any)["models"].(map[string]any)
 	image := ocModels["vision/image"].(map[string]any)
-	if image["attachment"] != true {
-		t.Fatalf("OpenCode image attachment: %v", image)
+	// OpenCode 2 warns on attachment, a V1 field it ignores (#2209)
+	if _, ok := image["attachment"]; ok {
+		t.Fatalf("OpenCode image model still has attachment: %v", image)
 	}
 	modalities := image["modalities"].(map[string]any)
 	if !reflect.DeepEqual(modalities["input"], []any{"text", "image"}) || !reflect.DeepEqual(modalities["output"], []any{"text"}) {
@@ -86,6 +98,34 @@ func TestConfiguredModelsAdvertiseImageInput(t *testing.T) {
 			t.Fatalf("unexpected Pi model: %v", entry)
 		}
 	}
+
+	// omp: an entry written before input was, brought up to date by Sync
+	ompModels := filepath.Join(home, ".omp", "agent", "models.yml")
+	os.MkdirAll(filepath.Dir(ompModels), 0o755)
+	os.WriteFile(ompModels, []byte("providers:\n  magpie:\n    baseUrl: x\n    models:\n      - id: vision/image\n"), 0o644)
+	if err := omp(home).Sync(); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(ompModels)
+	var om struct {
+		Providers map[string]struct {
+			Models []struct {
+				ID    string
+				Input []string
+			}
+		}
+	}
+	if err := yaml.Unmarshal(b, &om); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]string{"vision/image": {"text", "image"}, "vision/text": {"text"}, "vision/unknown": nil}
+	got := map[string][]string{}
+	for _, m := range om.Providers["magpie"].Models {
+		got[m.ID] = m.Input
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("omp input: %v\n%s", got, b)
+	}
 }
 
 func imageInputBool(v bool) *bool { return &v }
@@ -93,6 +133,7 @@ func imageInputBool(v bool) *bool { return &v }
 func TestInferredGroupImagesReachAgentCatalogs(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	if err := os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755); err != nil {
@@ -114,9 +155,9 @@ func TestInferredGroupImagesReachAgentCatalogs(t *testing.T) {
 	if err := catalog.SaveLive("unknown", "https://example.test/v1", []catalog.Model{{ID: "claude-sonnet-4-5"}}); err != nil {
 		t.Fatal(err)
 	}
-	id := "group/auto-claude-sonnet-4-5"
+	id := "auto/claude-sonnet-4-5"
 	oc := magpieProviderJSON("opencode").(map[string]any)["models"].(map[string]any)[id].(map[string]any)
-	if oc["attachment"] != true || !reflect.DeepEqual(oc["modalities"].(map[string]any)["input"], []string{"text", "image"}) {
+	if _, ok := oc["attachment"]; ok || !reflect.DeepEqual(oc["modalities"].(map[string]any)["input"], []string{"text", "image"}) {
 		t.Fatalf("OpenCode group image input: %v", oc)
 	}
 	pi := magpieProviderJSON("pi").(map[string]any)["models"].([]map[string]any)

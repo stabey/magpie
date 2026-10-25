@@ -3,7 +3,6 @@ package library
 import (
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -32,22 +31,53 @@ type Project struct {
 	// once they're empty; Gitignore is whether it made the .gitignore
 	Made      []string `json:"made,omitempty"`
 	Gitignore bool     `json:"gitignore,omitempty"`
+	// Servers are the library's MCP servers the project has, and for which
+	// agents (project_mcp.go)
+	Servers map[string][]string `json:"servers,omitempty"`
+	// Wrote are, by the project's file (.mcp.json), the servers magpie
+	// wrote in it, the only entries it ever takes out
+	Wrote map[string][]string `json:"wrote,omitempty"`
+	// Startup are, by the project's file, the startup timeout magpie
+	// wrote in each server's entry there (Codex's startup_timeout_sec):
+	// one other than this is the user's
+	Startup map[string]map[string]float64 `json:"startup,omitempty"`
+	// MadeFiles are the files magpie made to write servers in, listed in
+	// the .gitignore and taken away again once nothing's left in them
+	MadeFiles []string `json:"madeFiles,omitempty"`
 }
 
 // projectSkillsDirs is where, in a project, each agent reads skills of its
 // own from — only an agent that does: Claude Code its .claude/skills, and
 // those that read the shared .agents/skills (Codex from where it runs to
-// the repository's root, Gemini CLI, OpenCode, Pi, Cursor and Copilot)
-// that one, so that one folder serves them all. MiMo Code, Crush, ZCode,
-// DeepSeek Harness and oh-my-pi say of no project folder magpie can rely on.
+// the repository's root, Gemini CLI, OpenCode, Pi, Cursor, Copilot, Antigravity,
+// Kimi Code, Goose and Grok Build, Droid — docs.factory.com/cli/configuration/
+// skills — and Cline's CLI, which reads .clinerules, .cline and .agents
+// skills folders in the workspace, @cline/shared 3.0.70) that one, so that
+// one folder serves them all. Qoder (and Qoder CN) read .qoder/skills
+// (getProjectSkillsDir, @qoder-ai/qodercli 1.1.69, whose .agents/skills
+// a setting can turn off), CodeBuddy Code .codebuddy/skills
+// (getProjectSkillsDir, @tencent-ai/codebuddy-code 2.164.0) and Command
+// Code .commandcode/skills (commandcode.ai/docs/skills). MiMo Code, Crush,
+// ZCode, DeepSeek Harness and oh-my-pi say of no project folder magpie can
+// rely on.
 var projectSkillsDirs = map[string]string{
-	"claude":   ".claude/skills",
-	"codex":    ".agents/skills",
-	"gemini":   ".agents/skills",
-	"opencode": ".agents/skills",
-	"pi":       ".agents/skills",
-	"cursor":   ".agents/skills",
-	"copilot":  ".agents/skills",
+	"claude":      ".claude/skills",
+	"codex":       ".agents/skills",
+	"gemini":      ".agents/skills",
+	"opencode":    ".agents/skills",
+	"pi":          ".agents/skills",
+	"cursor":      ".agents/skills",
+	"copilot":     ".agents/skills",
+	"agy":         ".agents/skills",
+	"kimi":        ".agents/skills",
+	"goose":       ".agents/skills",
+	"grok":        ".agents/skills",
+	"droid":       ".agents/skills",
+	"cline":       ".agents/skills",
+	"qoder":       ".qoder/skills",
+	"qoder-cn":    ".qoder/skills",
+	"codebuddy":   ".codebuddy/skills",
+	"commandcode": ".commandcode/skills",
 }
 
 // ProjectSkillsDir is the folder, in a project, an agent reads its skills
@@ -81,7 +111,7 @@ func (l *Library) syncProject(p *Project, res *Result) {
 		res.Problems = append(res.Problems, Problem{Agent: p.Dir, What: "project:" + name, Error: err.Error()})
 	}
 	if fi, err := os.Stat(p.Dir); err != nil || !fi.IsDir() {
-		if len(p.Skills) > 0 || len(p.Placed) > 0 {
+		if len(p.Skills) > 0 || len(p.Placed) > 0 || len(p.Servers) > 0 || len(p.Wrote) > 0 {
 			fail("", fmt.Errorf("the folder is gone"))
 		}
 		return
@@ -134,6 +164,9 @@ func (l *Library) syncProject(p *Project, res *Result) {
 	}
 	sort.Strings(placed)
 	p.Placed = placed
+	l.syncProjectMCP(p, func(what string, err error) {
+		res.Problems = append(res.Problems, Problem{Agent: p.Dir, What: "project:" + what, Error: err.Error()})
+	})
 	if err := p.writeIgnore(); err != nil {
 		fail("", fmt.Errorf(".gitignore: %w", err))
 	}
@@ -146,15 +179,23 @@ var errForeign = errors.New("not magpie's")
 // copy made again whenever the library's differs from it.
 func (p *Project) place(e, name string) error {
 	abs := filepath.Join(p.Dir, filepath.FromSlash(e))
-	lib := skillDir(name)
 	if fi, err := os.Lstat(abs); err == nil {
 		if !ours(abs, name) {
 			return errForeign
 		}
-		link := fi.Mode()&fs.ModeSymlink != 0
+		link := linkEntry(fi)
 		// a copy stands for a link on Windows without the right to make one
-		if !p.Copy && link || !link && (p.Copy || runtime.GOOS == "windows") && hashDir(abs) == hashDir(realDir(lib)) {
+		if !p.Copy && link {
 			return nil
+		}
+		if !link {
+			current, err := copyIsFresh(abs, hashDir(realDir(skillDir(name))), false)
+			if err != nil {
+				return err
+			}
+			if (p.Copy || runtime.GOOS == "windows") && current {
+				return nil
+			}
 		}
 	}
 	if err := p.mkdirs(filepath.Dir(abs)); err != nil {
@@ -166,22 +207,7 @@ func (p *Project) place(e, name string) error {
 		}
 		return link(abs, name)
 	}
-	// the new copy is made beside and put in the old one's place
-	next := filepath.Join(filepath.Dir(abs), "."+name+".magpie-next")
-	os.RemoveAll(next)
-	if err := copyDir(realDir(lib), next); err != nil {
-		os.RemoveAll(next)
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(next, marker), []byte("copied from "+lib+" by magpie, and copied again when it changes\n"), 0o644); err != nil {
-		os.RemoveAll(next)
-		return err
-	}
-	if err := unlink(abs); err != nil {
-		os.RemoveAll(next)
-		return err
-	}
-	return os.Rename(next, abs)
+	return copyIn(abs, name)
 }
 
 // mkdirs makes dir and the folders above it the project hasn't, noting
@@ -242,12 +268,13 @@ func (p *Project) writeIgnore() error {
 	}
 	rest := stripIgnore(strings.ReplaceAll(string(b), "\r\n", "\n"))
 	out := rest
-	if len(p.Placed) > 0 {
+	if ignored := slices.Concat(p.Placed, p.MadeFiles); len(ignored) > 0 {
+		sort.Strings(ignored)
 		if out != "" {
 			out += "\n"
 		}
 		out += ignoreBegin + "\n"
-		for _, e := range p.Placed {
+		for _, e := range ignored {
 			out += "/" + e + "\n"
 		}
 		out += ignoreEnd + "\n"
@@ -327,7 +354,7 @@ func notGlobal(dir string) error {
 	if realDir(dir) == realDir(home()) {
 		return fmt.Errorf("the home folder's skills are every project's: give skills to the agents themselves instead")
 	}
-	for _, t := range Targets() {
+	for _, t := range everyTarget() {
 		if t.Skills == "" {
 			continue
 		}
@@ -337,20 +364,38 @@ func notGlobal(dir string) error {
 			}
 		}
 	}
+	for _, t := range everyTarget() {
+		if t.MCP == nil {
+			continue
+		}
+		for _, f := range projectMCPFiles {
+			if realDir(filepath.Join(dir, filepath.FromSlash(f.rel))) == realDir(t.MCP.Path) {
+				return fmt.Errorf("%s in there is %s's own MCP file", f.rel, t.Agent.Name)
+			}
+		}
+	}
 	return nil
 }
 
 // RemoveProject takes every skill magpie placed out of a project, and the
 // project off the list; what's left, it couldn't take away and says why.
-func RemoveProject(dir string) (*Result, error) {
+// keep takes the project off the list alone (#514: a project given a few
+// skills or servers once, to keep them): everything magpie put in the
+// folder — skills, servers in the agents' files, its lines in the
+// .gitignore — stays as it is, the user's from then on.
+func RemoveProject(dir string, keep bool) (*Result, error) {
 	return change(func(l *Library) error {
 		p := l.project(dir)
 		if p == nil {
 			return fmt.Errorf("no project %s", dir)
 		}
-		p.Skills = nil
+		if keep {
+			l.Projects = slices.DeleteFunc(l.Projects, func(x *Project) bool { return x == p })
+			return nil
+		}
+		p.Skills, p.Servers = nil, nil
 		l.syncProject(p, &Result{})
-		if len(p.Placed) == 0 {
+		if len(p.Placed) == 0 && len(p.Wrote) == 0 {
 			l.Projects = slices.DeleteFunc(l.Projects, func(x *Project) bool { return x == p })
 		}
 		return nil
@@ -407,6 +452,9 @@ type ProjectView struct {
 	Copy    bool                `json:"copy"`
 	Skills  map[string][]string `json:"skills"`
 	Placed  []string            `json:"placed"`
+	Servers map[string][]string `json:"servers"`
+	// Wrote are, by the project's file, the servers magpie wrote there
+	Wrote   map[string][]string `json:"wrote"`
 	Missing bool                `json:"missing,omitempty"` // the folder is gone
 	// Problems are, by skill ("" for the project's own), what couldn't be done
 	Problems map[string]string `json:"problems,omitempty"`
@@ -418,6 +466,13 @@ func projectViews(l *Library, problems []Problem) []ProjectView {
 		v := ProjectView{Dir: p.Dir, Name: filepath.Base(p.Dir), Copy: p.Copy, Skills: map[string][]string{}, Placed: append([]string{}, p.Placed...)}
 		for k, a := range p.Skills {
 			v.Skills[k] = append([]string{}, a...)
+		}
+		v.Servers, v.Wrote = map[string][]string{}, map[string][]string{}
+		for k, a := range p.Servers {
+			v.Servers[k] = append([]string{}, a...)
+		}
+		for k, a := range p.Wrote {
+			v.Wrote[k] = append([]string{}, a...)
 		}
 		if fi, err := os.Stat(p.Dir); err != nil || !fi.IsDir() {
 			v.Missing = true

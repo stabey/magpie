@@ -24,10 +24,12 @@
   apply();
 })();
 </script>
+<script>try{if(/Linux/.test(navigator.userAgent)&&!/Android/.test(navigator.userAgent)||localStorage.getItem("omarchy")||/[?&]omarchy=/.test(location.search))document.write('<script src="/omarchy.js"><\/script>')}catch(e){}</script>
 <link rel="icon" href="/favicon.png" type="image/png">
 <link rel="apple-touch-icon" href="/img/icon-256.png">
 <link rel="alternate" hreflang="en" href="https://usemagpie.ai/docs/import">
 <link rel="alternate" hreflang="zh" href="https://usemagpie.ai/docs/zh/import">
+<link rel="alternate" hreflang="ja" href="https://usemagpie.ai/docs/ja/import">
 <link rel="stylesheet" href="/docs.css">
 <meta property="og:title" content="Add to magpie">
 <meta property="og:description" content="One link puts your models in every agent your users run.">
@@ -43,10 +45,23 @@
     <a href="/">Home</a>
     <a href="/docs/start">Get started</a>
     <a href="/docs/intent">Intent routing</a>
+    <a href="/docs/plugins">Plugins</a>
+    <a class="toc-only" href="/docs/remote">Remote magpie</a>
+    <a class="toc-only" href="/docs/docker">Docker</a>
+    <a class="toc-only" href="/docs/privacy">Privacy</a>
+    <a class="toc-only" href="/docs/masking">Privacy masking</a>
     <a href="/docs/import">Add to magpie</a>
+    <a href="/docs/integrate">Integrate</a>
     <a href="https://github.com/yetone/magpie-releases/releases">Releases</a>
   </div>
-  <a class="icon-btn lang" href="/docs/zh/import" hreflang="zh" lang="zh" title="中文版">中文</a>
+  <div class="langs">
+    <button class="icon-btn lang" type="button" aria-label="Language" title="Language" aria-haspopup="true" aria-expanded="false" aria-controls="langs"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/><path d="M1.75 8h12.5M8 1.75c1.7 1.75 2.55 3.83 2.55 6.25S9.7 12.5 8 14.25M8 1.75C6.3 3.5 5.45 5.58 5.45 8S6.3 12.5 8 14.25"/></svg></button>
+    <div class="lang-menu" id="langs" hidden>
+      <a href="/docs/import" hreflang="en" lang="en">English</a>
+      <a href="/docs/zh/import" hreflang="zh" lang="zh">中文</a>
+      <a href="/docs/ja/import" hreflang="ja" lang="ja">日本語</a>
+    </div>
+  </div>
   <a class="icon-btn" href="https://discord.gg/vGSnD3ZKQF" aria-label="magpie on Discord" title="Join us on Discord"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M20.317 4.3698a19.7913 19.7913 0 00-4.8851-1.5152.0741.0741 0 00-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 00-.0785-.037 19.7363 19.7363 0 00-4.8852 1.515.0699.0699 0 00-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 00.0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 00.0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 00-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 01-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 01.0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 01.0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 01-.0066.1276 12.2986 12.2986 0 01-1.873.8914.0766.0766 0 00-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 00.0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 00.0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 00-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z"/></svg></a>
   <a class="icon-btn" href="https://github.com/yetone/magpie" aria-label="magpie on GitHub" title="Source on GitHub"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg></a>
   <button class="icon-btn theme" type="button" aria-label="Theme" title="Theme: system"><svg class="i-system" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.75" y="2.75" width="12.5" height="8.5" rx="1.5"/><path d="M5.5 14h5M8 11.25V14"/></svg><svg class="i-light" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="3"/><path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3 3l1 1M12 12l1 1M3 13l1-1M12 4l1-1"/></svg><svg class="i-dark" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M13.5 9.5A5.5 5.5 0 0 1 6.5 2.5a5.5 5.5 0 1 0 7 7Z"/></svg></button>
@@ -110,6 +125,7 @@
       <tr><td><code>chat</code></td><td>OpenAI Chat Completions base URL, ending in <code>/v1</code> (magpie appends <code>/chat/completions</code>).</td></tr>
       <tr><td><code>responses</code></td><td>OpenAI Responses base URL, ending in <code>/v1</code>. Codex speaks only this API; magpie translates for it when you don’t.</td></tr>
       <tr><td><code>anthropic</code></td><td>Anthropic Messages base URL: the root, without <code>/v1</code>.</td></tr>
+      <tr><td><code>gemini</code></td><td>Google Gemini API base URL, ending in <code>/v1beta</code>, as the app’s editor and the TUI take one.</td></tr>
       <tr><td><code>key</code></td><td>The user’s API key. Leave it out and the user pastes one in the dialog.</td></tr>
       <tr><td><code>models</code></td><td>Model ids to offer the agents, comma separated. Without it, magpie lists the models your <code>/v1/models</code> returns.</td></tr>
       <tr><td><code>id</code></td><td>The id agents use in <code>id/model</code>. Defaults to the name, lowercased with dashes (<code>Acme Relay</code> → <code>acme-relay</code>).</td></tr>
@@ -120,12 +136,12 @@
       <tr><td><code>preset</code><span class="req">or name</span></td><td>A preset id; its endpoints, catalog and pages are used, and <code>name</code> may rename it.</td></tr>
       <tr><td><code>region</code></td><td>With a preset that has regions, which one.</td></tr>
     </table></div>
-    <p>At least one of <code>chat</code>, <code>responses</code> and <code>anthropic</code> is required without a preset; give every API you speak, and each agent uses the one it speaks natively. Base URLs must be <b>https</b>, except plain http to <code>localhost</code>, loopback, private addresses and <code>*.local</code>, where model servers usually run without TLS. They can’t carry a query, a fragment or credentials.</p>
+    <p>At least one of <code>chat</code>, <code>responses</code>, <code>anthropic</code> and <code>gemini</code> is required without a preset; give every API you speak, and each agent uses the one it speaks natively. Base URLs must be <b>https</b>, except plain http to <code>localhost</code>, loopback, private addresses and <code>*.local</code>, where model servers usually run without TLS. They can’t carry a query, a fragment or credentials.</p>
 
     <h3 id="presets">Presets</h3>
     <p>Vendors magpie already knows. <code>magpie presets</code> prints the current list.</p>
     <div class="chips">
-      <span class="chip"><code>anthropic</code></span><span class="chip"><code>openai</code></span><span class="chip"><code>google</code></span><span class="chip"><code>deepseek</code></span><span class="chip"><code>xai</code></span><span class="chip"><code>moonshot</code><span>Kimi</span></span><span class="chip"><code>moonshot-cn</code></span><span class="chip"><code>zhipu</code><span>GLM</span></span><span class="chip"><code>zai</code></span><span class="chip"><code>minimax</code></span><span class="chip"><code>minimax-cn</code></span><span class="chip"><code>qwen</code></span><span class="chip"><code>qwen-cn</code></span><span class="chip"><code>mistral</code></span><span class="chip"><code>groq</code></span><span class="chip"><code>ollama-cloud</code></span><span class="chip"><code>openrouter</code></span><span class="chip"><code>opencode-go</code></span><span class="chip"><code>opencode-zen</code></span><span class="chip"><code>together</code></span><span class="chip"><code>fireworks</code></span><span class="chip"><code>siliconflow</code></span><span class="chip"><code>nvidia</code></span><span class="chip"><code>modelscope</code><span>魔搭</span></span><span class="chip"><code>aihubmix</code></span><span class="chip"><code>302ai</code></span><span class="chip"><code>yylx</code><span>auto · global · cn</span></span><span class="chip"><code>ollama</code></span><span class="chip"><code>lmstudio</code></span>
+      <span class="chip"><code>anthropic</code></span><span class="chip"><code>openai</code></span><span class="chip"><code>google</code></span><span class="chip"><code>deepseek</code></span><span class="chip"><code>xai</code></span><span class="chip"><code>moonshot</code><span>Kimi</span></span><span class="chip"><code>moonshot-cn</code></span><span class="chip"><code>kimi-code</code></span><span class="chip"><code>kimi-code-cn</code></span><span class="chip"><code>zhipu</code><span>GLM · api · coding</span></span><span class="chip"><code>zai</code><span>api · coding</span></span><span class="chip"><code>minimax</code></span><span class="chip"><code>minimax-cn</code></span><span class="chip"><code>stepfun</code><span>plan · api</span></span><span class="chip"><code>stepfun-cn</code><span>plan · api</span></span><span class="chip"><code>xiaomi</code><span>MiMo</span></span><span class="chip"><code>baidu-qianfan</code><span>千帆 · personal · team · api</span></span><span class="chip"><code>tencent-cloud</code><span>plan · cn · intl · enterprise · enterprise-intl</span></span><span class="chip"><code>huaweicloud</code><span>plan · api</span></span><span class="chip"><code>volcengine</code><span>火山方舟 · coding · agent · api</span></span><span class="chip"><code>qwen</code></span><span class="chip"><code>qwen-cn</code></span><span class="chip"><code>qwen-token-plan</code></span><span class="chip"><code>bailian-token-plan</code></span><span class="chip"><code>mistral</code></span><span class="chip"><code>groq</code></span><span class="chip"><code>bedrock</code></span><span class="chip"><code>ollama-cloud</code></span><span class="chip"><code>openrouter</code></span><span class="chip"><code>opencode-go</code></span><span class="chip"><code>clinepass</code></span><span class="chip"><code>opencode-zen</code></span><span class="chip"><code>kilo</code></span><span class="chip"><code>commandcode</code></span><span class="chip"><code>together</code></span><span class="chip"><code>fireworks</code></span><span class="chip"><code>siliconflow</code><span>cn · intl</span></span><span class="chip"><code>nvidia</code></span><span class="chip"><code>modelscope</code><span>魔搭</span></span><span class="chip"><code>aihubmix</code></span><span class="chip"><code>pipellm</code></span><span class="chip"><code>302ai</code></span><span class="chip"><code>cherryin</code></span><span class="chip"><code>yylx</code><span>auto · global · cn</span></span><span class="chip"><code>ollama</code></span><span class="chip"><code>lmstudio</code></span>
     </div>
     <p>A vendor with a preset only needs to add the key: <code>magpie://import?preset=deepseek&amp;key=sk-…</code>. Want yours on the list? <a href="https://github.com/yetone/magpie/issues">Open an issue</a>.</p>
 
@@ -141,6 +157,7 @@
         <label class="m-custom">OpenAI Chat base URL<input name="chat" class="mono" placeholder="https://api.acme.example/v1" value="https://api.acme.example/v1"></label>
         <label class="m-custom">Anthropic base URL<input name="anthropic" class="mono" placeholder="https://api.acme.example" value="https://api.acme.example"></label>
         <label class="m-custom">OpenAI Responses base URL <i>optional</i><input name="responses" class="mono" placeholder="https://api.acme.example/v1"></label>
+        <label class="m-custom">Gemini base URL <i>optional</i><input name="gemini" class="mono" placeholder="https://api.acme.example/v1beta"></label>
         <label class="m-custom">models.dev catalog <i>optional</i><input name="catalog" placeholder="openai"></label>
         <label>API key <i>optional</i><input name="key" class="mono" placeholder="sk-…" spellcheck="false"></label>
         <label>Models <i>comma separated</i><input name="models" class="mono" placeholder="gpt-5.5, claude-sonnet-5" value="gpt-5.5, claude-sonnet-5"></label>
@@ -220,7 +237,7 @@ href = <span class="s">"https://usemagpie.ai/import#"</span> + urlencode({
       <li><b>No silent overwrites.</b> When the id is already taken, the dialog says so and the button reads <em>Replace</em>.</li>
       <li><b>https only.</b> Plain http is refused except to this machine or the local network; <code>file:</code>, credentials in URLs and other schemes are refused outright.</li>
       <li><b>Read once.</b> Inside the app, the link’s contents are handed to the window a single time; a reload doesn’t bring the dialog back.</li>
-      <li><b>Icons are fetched, not embedded.</b> An <code>icon=</code> URL is downloaded by magpie itself, only after the user confirms the import, only over https, and only into its own icons folder — at most 1&nbsp;MB, and the type is checked. The host is resolved at connection time and magpie refuses to connect when it lands on loopback, private, link-local or reserved addresses, so a name that points back at the user’s own machine (or a DNS-rebinding trick) is refused. The page and the dialog never load a remote picture directly.</li>
+      <li><b>Icons are fetched, not embedded.</b> An <code>icon=</code> URL is downloaded by magpie, only after the user confirms the import, only over https, and only into its own icons folder — at most 1&nbsp;MB, and the type is checked. magpie asks for it through usemagpie.ai’s icon proxy, so your host sees Cloudflare’s address and never the user’s, and the fetch is made from Cloudflare, where nothing on the user’s own machine or network can be reached. A loopback or local-network name is refused before anything is asked. The page and the dialog never load a remote picture directly.</li>
       <li><b>Keys stay out of servers.</b> The web link keeps parameters in the fragment. The key ends up only in <code>~/.config/magpie/providers.json</code>, readable by the user alone.</li>
     </ul>
     <div class="note"><b>Keys in links are secrets.</b> Put a key in a link only on a page that user alone sees, and prefer a key minted for magpie that they can revoke. Never put a shared key in a public link.</div>
@@ -243,6 +260,11 @@ href = <span class="s">"https://usemagpie.ai/import#"</span> + urlencode({
     <a href="/">Home</a>
     <a href="/docs/start">Get started</a>
     <a href="/docs/intent">Intent routing</a>
+    <a href="/docs/plugins">Plugins</a>
+    <a href="/docs/remote">Remote magpie</a>
+    <a href="/docs/docker">Docker</a>
+    <a href="/docs/privacy">Privacy</a>
+    <a href="/docs/masking">Privacy masking</a>
     <a href="https://github.com/yetone/magpie">GitHub</a>
     <a href="https://discord.gg/vGSnD3ZKQF">Discord</a>
     <a href="https://github.com/yetone/magpie-releases/releases">Releases</a>
@@ -265,29 +287,35 @@ href = <span class="s">"https://usemagpie.ai/import#"</span> + urlencode({
     } catch {}
   }));
 
-  // The table of contents follows the reading position.
-  const links = [...document.querySelectorAll(".toc a")];
-  const heads = links.map((a) => document.getElementById(a.hash.slice(1)));
-  const spy = () => {
-    let i = 0;
-    heads.forEach((h, j) => { if (h.getBoundingClientRect().top < 140) i = j; });
-    if (innerHeight + scrollY >= document.body.scrollHeight - 4) i = heads.length - 1;
-    links.forEach((a, j) => a.classList.toggle("on", j === i));
-  };
-  addEventListener("scroll", spy, { passive: true }); spy();
 
   // Link builder. It mirrors the checks magpie makes, so a link that
   // builds here imports there.
   const PRESETS = [
-    ["anthropic", "Anthropic"], ["openai", "OpenAI"], ["google", "Google Gemini"], ["deepseek", "DeepSeek"],
-    ["xai", "xAI"], ["moonshot", "Kimi"], ["moonshot-cn", "Kimi (China)"], ["zhipu", "Zhipu GLM"], ["zai", "Z.ai"],
-    ["minimax", "MiniMax"], ["minimax-cn", "MiniMax (China)"], ["qwen", "Qwen"], ["qwen-cn", "Qwen (China)"], ["baidu-qianfan", "Baidu Qianfan"], ["tencent-token-plan", "Tencent Cloud Token Plan"], ["huaweicloud", "Huawei Cloud MaaS"], ["volcengine", "Volcengine Ark"],
-    ["mistral", "Mistral"], ["groq", "Groq"], ["ollama-cloud", "Ollama Cloud"], ["openrouter", "OpenRouter"], ["opencode-go", "OpenCode Go"],
-    ["opencode-zen", "OpenCode Zen"], ["together", "Together AI"], ["fireworks", "Fireworks"],
-    ["siliconflow", "SiliconFlow"], ["nvidia", "NVIDIA NIM"], ["modelscope", "ModelScope"], ["aihubmix", "AiHubMix"], ["302ai", "302.AI"], ["yylx", "鱼鱼连线"],
+    ["anthropic", "Anthropic"], ["openai", "OpenAI"], ["google", "Google Gemini"], ["deepseek", "DeepSeek"], ["xai", "xAI"],
+    ["moonshot", "Kimi"], ["moonshot-cn", "Kimi (China)"], ["kimi-code", "Kimi Code"], ["kimi-code-cn", "Kimi Code (China)"], ["zhipu", "Zhipu GLM"],
+    ["zai", "Z.ai"], ["minimax", "MiniMax"], ["minimax-cn", "MiniMax (China)"], ["stepfun", "StepFun"], ["stepfun-cn", "StepFun (China)"],
+    ["xiaomi", "Xiaomi MiMo"], ["baidu-qianfan", "Baidu Qianfan"], ["tencent-cloud", "Tencent Cloud"],
+    ["huaweicloud", "Huawei Cloud MaaS"], ["volcengine", "Volcengine Ark"], ["qwen", "Qwen"], ["qwen-cn", "Qwen (China)"], ["qwen-token-plan", "Qwen Token Plan"], ["bailian-token-plan", "Bailian Token Plan"],
+    ["mistral", "Mistral"], ["groq", "Groq"], ["bedrock", "Amazon Bedrock"], ["ollama-cloud", "Ollama Cloud"], ["nous", "Nous Portal"], ["openrouter", "OpenRouter"],
+    ["opencode-go", "OpenCode Go"], ["clinepass", "ClinePass"], ["opencode-zen", "OpenCode Zen"], ["kilo", "Kilo Gateway"], ["commandcode", "Command Code"],
+    ["together", "Together AI"], ["fireworks", "Fireworks"], ["siliconflow", "SiliconFlow"], ["nvidia", "NVIDIA NIM"], ["modelscope", "ModelScope"],
+    ["aihubmix", "AiHubMix"], ["pipellm", "PipeLLM"], ["302ai", "302.AI"], ["cherryin", "CherryIN"], ["yylx", "鱼鱼连线"],
     ["ollama", "Ollama"], ["lmstudio", "LM Studio"],
   ];
-  const REGIONS = { yylx: [["", "Default"], ["auto", "Auto"], ["global", "Global"], ["cn", "China Mainland"]], volcengine: [["", "Coding Plan"], ["agent", "Agent Plan"], ["api", "Pay as you go"]] };
+  const REGIONS = {
+    "zhipu": [["", "Pay as you go"], ["coding", "Coding Plan"]],
+    "zai": [["", "Pay as you go"], ["coding", "Coding Plan"]],
+    "stepfun": [["", "Step Plan"], ["api", "Pay as you go"]],
+    "stepfun-cn": [["", "Step Plan"], ["api", "Pay as you go"]],
+    "xiaomi": [["", "Plan · China"], ["plan-sgp", "Plan · Singapore"], ["plan-ams", "Plan · Europe"], ["api", "Pay as you go"]],
+    "baidu-qianfan": [["", "Token Plan Personal"], ["team", "Token Plan Enterprise"], ["api", "Pay as you go"]],
+    "tencent-cloud": [["", "Plan · China"], ["cn", "Pay as you go · China"], ["intl", "Pay as you go · Global"], ["enterprise", "Enterprise plan · China"], ["enterprise-intl", "Enterprise plan · Global"]],
+    "huaweicloud": [["", "Token Plan"], ["api", "Pay as you go"]],
+    "volcengine": [["", "Coding Plan"], ["agent", "Agent Plan"], ["api", "Pay as you go"]],
+    "bedrock": [["", "us-east-1"], ["us-east-2", "us-east-2"], ["us-west-2", "us-west-2"], ["eu-central-1", "eu-central-1"], ["eu-west-1", "eu-west-1"], ["eu-west-3", "eu-west-3"], ["ap-northeast-1", "ap-northeast-1"], ["ap-southeast-1", "ap-southeast-1"], ["ap-southeast-2", "ap-southeast-2"], ["ap-south-1", "ap-south-1"]],
+    "siliconflow": [["", "China"], ["intl", "Global"]],
+    "yylx": [["", "Auto"], ["global", "Global"], ["cn", "China Mainland"]],
+  };
   const f = document.getElementById("b");
   const el = (n) => f.elements[n];
   el("preset").innerHTML = PRESETS.map(([id, n]) => `<option value="${id}">${n} · ${id}</option>`).join("");
@@ -324,7 +352,7 @@ href = <span class="s">"https://usemagpie.ai/import#"</span> + urlencode({
       if (!put("name")) errs.push("A name is required.");
       put("id");
       let any = false;
-      for (const k of ["chat", "responses", "anthropic"]) {
+      for (const k of ["chat", "responses", "anthropic", "gemini"]) {
         const v = put(k);
         el(k).classList.toggle("bad", !!v && !base(v));
         if (v) { any = true; if (!base(v)) errs.push(`${k}= must be an https base URL, without a query.`); }
@@ -375,5 +403,6 @@ href = <span class="s">"https://usemagpie.ai/import#"</span> + urlencode({
   build();
 })();
 </script>
+<script src="/docs.js"></script>
 </body>
 </html>

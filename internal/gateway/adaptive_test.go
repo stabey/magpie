@@ -53,6 +53,9 @@ func TestAdaptiveThinking(t *testing.T) {
 		"claude-opus-4-7": true, "anthropic.claude-sonnet-4.6-v1": true, "claude-sonnet-5": true,
 		"claude-sonnet-4-5-20250929": false, "claude-sonnet-4-20250514": false, "claude-opus-4-1": false,
 		"claude-3-7-sonnet-20250219": false, "deepseek-v4": false, "claude-haiku-4-5": false,
+		"claude-opus-5.5": true, "opus-5.5": true, "anthropic/claude-opus-5.5": true, "claude-opus-5-5[1m]": true,
+		"claude-opus-5-5-20260901": true, "claude-5-5-opus": true, "claude-3-5-sonnet-20241022": false,
+		"claude-opus-4-20250514": false, "claude-opus-4-1-20250805": false, "kimi-k3": false, "gpt-5.5": false,
 	} {
 		if got := adaptiveOnly(model); got != want {
 			t.Errorf("adaptiveOnly(%q) = %v", model, got)
@@ -60,11 +63,15 @@ func TestAdaptiveThinking(t *testing.T) {
 	}
 	var out map[string]any
 	json.Unmarshal(buildAnthropic(&Request{Thinking: true, Effort: "xhigh"}, "claude-opus-5-5"), &out)
-	if th, _ := json.Marshal(out["thinking"]); string(th) != `{"type":"adaptive"}` {
+	if th, _ := json.Marshal(out["thinking"]); string(th) != `{"display":"summarized","type":"adaptive"}` {
 		t.Errorf("thinking = %s", th)
 	}
-	if oc, _ := json.Marshal(out["output_config"]); string(oc) != `{"effort":"max"}` {
+	if oc, _ := json.Marshal(out["output_config"]); string(oc) != `{"effort":"xhigh"}` {
 		t.Errorf("output_config = %s", oc)
+	}
+	json.Unmarshal(buildAnthropic(&Request{Thinking: true, Effort: "xhigh"}, "claude-opus-4-6"), &out)
+	if oc, _ := json.Marshal(out["output_config"]); string(oc) != `{"effort":"max"}` {
+		t.Errorf("4.6 output_config = %s", oc)
 	}
 	json.Unmarshal(buildAnthropic(&Request{Thinking: true, Effort: "low"}, "claude-sonnet-4-5"), &out)
 	if th, _ := json.Marshal(out["thinking"]); string(th) != `{"budget_tokens":4096,"type":"enabled"}` {

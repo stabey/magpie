@@ -49,8 +49,8 @@ function serve(lang) {
 }
 
 const want = {
-  en: { row: "served gpt-6-luna", tag: "requested gpt-6-sol · served gpt-6-luna", story: /its reply says gpt-6-luna answered it: another model/ },
-  zh: { row: "实际 gpt-6-luna", tag: "请求 gpt-6-sol · 实际 gpt-6-luna", story: /回复写明由 gpt-6-luna 作答：这是另一个模型/ },
+  en: { row: "served gpt-6-luna", tag: "requested gpt-6-sol · served gpt-6-luna", story: /asked for gpt-6-sol, but its reply says gpt-6-luna answered: likely another model/ },
+  zh: { row: "实际 gpt-6-luna", tag: "请求 gpt-6-sol · 实际 gpt-6-luna", story: /请求的是 gpt-6-sol，但回复说是 gpt-6-luna 作答，很可能换成了别的模型/ },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -71,7 +71,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       await page.goto("http://magpie.test/?view=routing");
-      await page.locator(".rt-day").nth(1).click();
+      await page.locator(".rt-days .rt-day").nth(1).click();
       await page.locator(".rt-req").nth(served.length - 1).waitFor();
 
       // the list: the swapped one alone carries the mark, whole, beside the
@@ -88,7 +88,19 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
       // the story says so, and the click leaves the row where it is
       const row = page.locator(".rt-req").nth(0);
-      const was = await row.evaluate((e) => e.getBoundingClientRect().top);
+      // measure once the page holds still: the day's rows arriving grow the
+      // page above the list, and the day button's click is kept in place by
+      // scrolling the view, which can land after the last row is in
+      const was = await row.evaluate(async (e) => {
+        let last = NaN;
+        for (let i = 0; i < 60; i++) {
+          await new Promise((r) => requestAnimationFrame(r));
+          const top = e.getBoundingClientRect().top;
+          if (top === last) return top;
+          last = top;
+        }
+        return last;
+      });
       const scrolled = await page.evaluate(() => [scrollX, scrollY, document.scrollingElement.scrollTop]);
       await row.click();
       await page.waitForTimeout(600);

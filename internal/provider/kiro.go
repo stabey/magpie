@@ -1,5 +1,14 @@
 package provider
 
+// PLUGIN-SERVED (see AGENTS.md): Kiro ("kiro") is a deprecated built-in
+// subscription served by its plugin, @magpie-community/opencode-kiro-auth,
+// once moved onto it (provider.Moved; the default for a new sign-in). A
+// moved one's sign-ins, models, requests and usage are all the plugin's,
+// never this code's (only the move, in migrate*.go, still reads its
+// accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/kiro) and raise the mover's
+// min in internal/provider/migrate_kiro.go.
+
 // A Kiro subscription is used through Kiro's own API, the one kiro-cli
 // talks to (gateway/kiro.go speaks it), with the sign-in kiro-cli or the
 // Kiro IDE already has: kiro-cli keeps its tokens in its SQLite database,
@@ -23,27 +32,29 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/steady"
 )
 
 // KiroExecutable finds kiro-cli, which refreshes its own sign-in; a var so
 // tests can fake it. The installer puts it in ~/.local/bin, and on macOS
 // inside Kiro CLI.app as well.
 var KiroExecutable = func() string {
-	if p, err := exec.LookPath("kiro-cli"); err == nil {
+	if p, err := proc.LookPath("kiro-cli"); err == nil {
 		return p
 	}
 	home, _ := os.UserHomeDir()
-	for _, p := range []string{filepath.Join(home, ".local", "bin", "kiro-cli"),
-		"/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli", "/usr/local/bin/kiro-cli", "/opt/homebrew/bin/kiro-cli"} {
+	for _, p := range append([]string{filepath.Join(home, ".local", "bin", "kiro-cli")}, proc.SystemDirs(
+		"/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli", "/usr/local/bin/kiro-cli", "/opt/homebrew/bin/kiro-cli")...) {
 		if st, err := os.Stat(p); err == nil && !st.IsDir() {
 			return p
 		}
@@ -57,7 +68,7 @@ var kiroCLIDB = func() string {
 	home, _ := os.UserHomeDir()
 	switch runtime.GOOS {
 	case "windows":
-		dir := os.Getenv("APPDATA")
+		dir := appdir.Getenv("APPDATA")
 		if dir == "" {
 			dir = filepath.Join(home, "AppData", "Roaming")
 		}
@@ -95,6 +106,7 @@ type kiroCred struct {
 	clientSecret    string    // idc
 	tokenURL        string    // external-idp
 	social          bool      // an IDE sign-in with Google or GitHub
+	builderID       bool      // an AWS Builder ID sign-in, which has no profile of its own
 
 	dbKey   string // the auth_kv row it came from
 	idePath string // or the IDE's file
@@ -108,6 +120,9 @@ func (c kiroCred) fresh() bool {
 // (Builder ID, IAM Identity Center), or with a company's own identity
 // provider.
 func readKiroCLI() (kiroCred, bool) {
+	if settings.AccountDiscoveryOff() {
+		return kiroCred{}, false
+	}
 	path := kiroCLIDB()
 	if !fileExists(path) {
 		return kiroCred{}, false
@@ -143,6 +158,8 @@ func readKiroCLI() (kiroCred, bool) {
 			c.method = "social"
 		case "odic":
 			c.method = "idc"
+			// as kiro-cli tells them apart: Builder ID's start URL, or none
+			c.builderID = str(m, "start_url") == "" || str(m, "start_url") == kiroBuilderIDStart
 			if reg := get("kirocli:odic:device-registration"); reg != nil {
 				c.clientID, c.clientSecret = str(reg, "client_id"), str(reg, "client_secret")
 			}
@@ -163,6 +180,9 @@ func readKiroCLI() (kiroCred, bool) {
 
 // readKiroIDE reads the Kiro IDE's sign-in.
 func readKiroIDE() (kiroCred, bool) {
+	if settings.AccountDiscoveryOff() {
+		return kiroCred{}, false
+	}
 	path := filepath.Join(kiroIDEDir(), "kiro-auth-token.json")
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -175,12 +195,14 @@ func readKiroIDE() (kiroCred, bool) {
 		Region       string `json:"region"`
 		ClientIDHash string `json:"clientIdHash"`
 		AuthMethod   string `json:"authMethod"`
+		Provider     string `json:"provider"`
 		ProfileArn   string `json:"profileArn"`
 	}
 	if json.Unmarshal(b, &t) != nil || t.AccessToken == "" {
 		return kiroCred{}, false
 	}
-	c := kiroCred{access: t.AccessToken, refresh: t.RefreshToken, region: t.Region, profile: t.ProfileArn, method: "idc", idePath: path}
+	c := kiroCred{access: t.AccessToken, refresh: t.RefreshToken, region: t.Region, profile: t.ProfileArn, method: "idc", idePath: path,
+		builderID: strings.EqualFold(t.Provider, "BuilderId")}
 	c.expires, _ = time.Parse(time.RFC3339Nano, t.ExpiresAt)
 	if c.region == "" {
 		c.region = "us-east-1"
@@ -200,25 +222,15 @@ func readKiroIDE() (kiroCred, bool) {
 	return c, true
 }
 
-// readKiro is the sign-in to use first: the key saved on the provider, else
-// that of the account in use first (kiro_accounts.go).
-func readKiro(key string) (kiroCred, bool) {
-	if key != "" {
-		return readKiroAt(key, "")
-	}
-	ls := kiroLogins()
-	if len(ls) == 0 {
-		return kiroCred{}, false
-	}
-	return readKiroAt("", ls[0].Home)
-}
-
 // readKiroAt is one account's sign-in: the key saved on the provider, one
 // magpie signed in in home, or, with neither, Kiro's own: kiro-cli's, else
 // the IDE's.
 func readKiroAt(key, home string) (kiroCred, bool) {
 	if key != "" {
 		return kiroCred{access: key, method: "apikey", region: "us-east-1"}, true
+	}
+	if settings.AccountDiscoveryOff() {
+		return kiroCred{}, false
 	}
 	if home != "" {
 		return readKiroFile(filepath.Join(home, kiroTokenFile))
@@ -227,13 +239,6 @@ func readKiroAt(key, home string) (kiroCred, bool) {
 		return c, true
 	}
 	return readKiroIDE()
-}
-
-// kiroSignedIn is whether there is a Kiro sign-in to use, without asking
-// anyone.
-func kiroSignedIn(key string) bool {
-	_, ok := readKiro(key)
-	return ok
 }
 
 // KiroAuth is what a call to Kiro's API is made with.
@@ -316,6 +321,8 @@ func KiroAuthOf(ctx context.Context, key, home string, stale bool) (KiroAuth, er
 	}
 	return a, nil
 }
+
+// kiroRegion is where the account's API is: the region its profile is in,
 
 // kiroRegion is where the account's API is: the region its profile is in,
 // else the nearest of Kiro's two to where it signed in.
@@ -455,11 +462,11 @@ func saveKiro(c kiroCred) {
 }
 
 func writeFileAtomic(path string, b []byte) error {
-	tmp := path + ".magpie-tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	path, err := edit.Target(path) // a symlink stays, its target written
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	return steady.WriteFile(path, b, 0o600) // on the disk before it is renamed in (#1505)
 }
 
 // kiroPost posts to a sign-in endpoint.
@@ -488,10 +495,14 @@ func kiroPost(ctx context.Context, u, contentType string, body []byte, headers m
 	return json.Unmarshal(b, dst)
 }
 
+// kiroManagementURL is where Kiro's management API is in a region; a var so
+// tests can answer it.
+var kiroManagementURL = func(region string) string { return "https://management." + region + ".kiro.dev/" }
+
 // kiroManagement calls Kiro's management API: GET with a query, or POST
 // with a JSON body when body is set.
 func kiroManagement(ctx context.Context, region, token, tokenType, method string, q url.Values, body any, dst any) error {
-	u := "https://management." + region + ".kiro.dev/" + method
+	u := kiroManagementURL(region) + method
 	verb := http.MethodGet
 	var rd io.Reader
 	if body != nil {
@@ -537,11 +548,21 @@ func (e *kiroStatusError) Error() string {
 	return "Kiro: " + http.StatusText(e.status)
 }
 
+// A Builder ID sign-in has no profile of its own, and Kiro won't list one
+// for it (List-Available-Profiles is a 403, "AWS Builder ID is not supported
+// for this operation"); the Kiro IDE and kiro-cli name this service profile
+// for it instead, so its models, usage and chat are asked with it too.
+const (
+	kiroBuilderIDStart   = "https://view.awsapps.com/start"
+	kiroBuilderIDProfile = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+)
+
 // kiroProfile finds the profile a sign-in that doesn't name one uses: an
-// API key's own, or the first Kiro lists in either of its regions.
+// API key's own, Builder ID's, or the first Kiro lists in either of its
+// regions.
 func kiroProfile(ctx context.Context, c kiroCred) (string, error) {
 	if c.method == "apikey" {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://management.us-east-1.kiro.dev/", strings.NewReader("{}"))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, kiroManagementURL("us-east-1"), strings.NewReader("{}"))
 		if err != nil {
 			return "", err
 		}
@@ -567,6 +588,9 @@ func kiroProfile(ctx context.Context, c kiroCred) (string, error) {
 		}
 		return out.Profile.Arn, nil
 	}
+	if c.builderID {
+		return kiroBuilderIDProfile, nil
+	}
 	tt := ""
 	if c.method == "external-idp" {
 		tt = "EXTERNAL_IDP"
@@ -579,6 +603,11 @@ func kiroProfile(ctx context.Context, c kiroCred) (string, error) {
 			} `json:"profiles"`
 		}
 		if err := kiroManagement(ctx, region, c.access, tt, "List-Available-Profiles", nil, map[string]any{}, &out); err != nil {
+			// a Builder ID sign-in the token didn't say was one
+			var se *kiroStatusError
+			if c.method == "idc" && errors.As(err, &se) && se.status == http.StatusForbidden && strings.Contains(se.body, "Builder ID") {
+				return kiroBuilderIDProfile, nil
+			}
 			last = err
 			continue
 		}
@@ -592,71 +621,6 @@ func kiroProfile(ctx context.Context, c kiroCred) (string, error) {
 		last = errors.New("Kiro has no profile for this sign-in")
 	}
 	return "", last
-}
-
-// kiroModels asks Kiro for the account's models, the default first.
-func kiroModels(ctx context.Context, a KiroAuth) ([]catalog.Model, error) {
-	var out kiroModelList
-	q := url.Values{"origin": {"KIRO_CLI"}, "profileArn": {a.Profile}}
-	if err := kiroManagement(ctx, a.Region, a.Token, a.TokenType, "List-Available-Models", q, nil, &out); err != nil {
-		return nil, err
-	}
-	ms := out.models()
-	if len(ms) == 0 {
-		return nil, errors.New("Kiro listed no models")
-	}
-	return ms, nil
-}
-
-// kiroModelList is ListAvailableModels' answer:
-//
-//	{"models": [{"modelId": "claude-sonnet-4.5", "modelName": "Claude Sonnet 4.5",
-//	  "supportedInputTypes": ["TEXT", "IMAGE"],
-//	  "tokenLimits": {"maxInputTokens": 200000, "maxOutputTokens": 64000}}],
-//	 "defaultModel": {"modelId": "auto"}}
-type kiroModelList struct {
-	Models []struct {
-		ID          string   `json:"modelId"`
-		Name        string   `json:"modelName"`
-		Inputs      []string `json:"supportedInputTypes"`
-		TokenLimits struct {
-			Input  int `json:"maxInputTokens"`
-			Output int `json:"maxOutputTokens"`
-		} `json:"tokenLimits"`
-	} `json:"models"`
-	Default struct {
-		ID string `json:"modelId"`
-	} `json:"defaultModel"`
-}
-
-func (l kiroModelList) models() []catalog.Model {
-	var out []catalog.Model
-	for _, m := range l.Models {
-		if m.ID == "" {
-			continue
-		}
-		name := m.Name
-		if name == "" || name == m.ID {
-			name = m.ID
-			if m.ID == "auto" {
-				name = "Auto"
-			}
-		}
-		images := false
-		for _, t := range m.Inputs {
-			if strings.EqualFold(t, "IMAGE") {
-				images = true
-			}
-		}
-		cm := catalog.Model{ID: m.ID, Name: name, Provider: "kiro", Context: m.TokenLimits.Input, Output: m.TokenLimits.Output,
-			Images: images, ImageInput: &images}
-		if m.ID == l.Default.ID {
-			out = append([]catalog.Model{cm}, out...)
-		} else {
-			out = append(out, cm)
-		}
-	}
-	return out
 }
 
 // kiroLimits is GetUsageLimits' answer, as far as magpie reads it.
@@ -704,62 +668,6 @@ func (l kiroLimits) plan() string {
 	return strings.Join(words, " ")
 }
 
-// windows are the credits used of each allowance: the month's, and a free
-// trial's while it runs.
-func (l kiroLimits) windows() []QuotaWindow {
-	out := []QuotaWindow{}
-	at := func(secs float64) *time.Time {
-		if secs <= 0 {
-			return nil
-		}
-		t := time.Unix(int64(secs), 0)
-		return &t
-	}
-	count := func(used, limit float64) string {
-		return strings.TrimSuffix(strings.TrimRight(fmt.Sprintf("%.2f", used), "0"), ".") + " / " + fmt.Sprintf("%g", limit)
-	}
-	for _, u := range l.Usage {
-		if t := u.FreeTrial; t != nil && strings.EqualFold(t.Status, "ACTIVE") && t.Limit > 0 {
-			out = append(out, QuotaWindow{Name: "Free trial", Used: 100 * t.Used / t.Limit, ResetsAt: at(t.Expiry), Display: count(t.Used, t.Limit)})
-		}
-		if u.Limit <= 0 {
-			continue
-		}
-		name := u.NamePl
-		if name == "" {
-			name = u.Name
-		}
-		if name == "" {
-			name = "Credits"
-		}
-		reset := u.NextReset
-		if reset == 0 {
-			reset = l.NextReset
-		}
-		out = append(out, QuotaWindow{Name: name, Used: 100 * u.Used / u.Limit, ResetsAt: at(reset), Display: count(u.Used, u.Limit),
-			Span: 30 * 24 * time.Hour})
-	}
-	return out
-}
-
-// kiroQuotaAt is one account's allowance: the key's, that of the account
-// magpie signed in in home, or Kiro's own sign-in's.
-func kiroQuotaAt(ctx context.Context, key, home string) SubscriptionQuota {
-	q := SubscriptionQuota{Provider: "kiro", Name: "Kiro", Icon: "kiro-color", Windows: []QuotaWindow{}}
-	a, err := KiroAuthOf(ctx, key, home, false)
-	if err != nil {
-		q.Error = err.Error()
-		return q
-	}
-	l, err := kiroUsageLimits(ctx, a, true)
-	if err != nil {
-		q.Error = err.Error()
-		return q
-	}
-	q.Plan, q.User, q.Windows = l.plan(), l.UserInfo.Email, l.windows()
-	return q
-}
-
 // kiroStatus is who each account is, by key and home, as Kiro last said.
 var kiroStatus struct {
 	sync.Mutex
@@ -789,8 +697,9 @@ func kiroIdentity(key, home string) (user, plan string) {
 	}
 	if time.Since(s.at) > 5*time.Minute && !s.refreshing {
 		s.refreshing = true
+		ask := askKiroIdentity // read here: a test puts its own back meanwhile
 		go func() {
-			u, p := askKiroIdentity(key, home)
+			u, p := ask(key, home)
 			kiroStatus.Lock()
 			if u != "" || p != "" {
 				s.user, s.plan = u, p
@@ -825,65 +734,4 @@ var askKiroIdentity = func(key, home string) (user, plan string) {
 		return "", ""
 	}
 	return l.UserInfo.Email, l.plan()
-}
-
-// kiroAccount is the Kiro account in use first: the key saved on the
-// provider, else the first of the accounts signed in.
-func kiroAccount() (Provider, bool) {
-	key := kiroKey()
-	var acct *Account
-	if key != "" {
-		user, plan := kiroIdentity(key, "")
-		acct = &Account{Agent: "kiro", User: firstNonEmpty(user, "Kiro API key"), Plan: firstNonEmpty(plan, "API key")}
-	} else {
-		ls := kiroLogins()
-		if len(ls) == 0 {
-			return Provider{}, false
-		}
-		acct = kiroAcct(ls[0])
-	}
-	return kiroProvider(key, acct), true
-}
-
-// kiroAcct is a signed-in Kiro account, with the plan Kiro last said.
-func kiroAcct(l kiroLogin) *Account {
-	_, plan := kiroIdentity("", l.Home)
-	return &Account{Agent: "kiro", User: l.User, Plan: firstNonEmpty(plan, l.Plan), Home: l.Home}
-}
-
-func kiroProvider(key string, acct *Account) Provider {
-	home := acct.Home
-	acct.models = func() []catalog.Model {
-		// what the last fetch saved — Available() runs on every request,
-		// so Kiro isn't asked here
-		if ms, _, ok := catalog.Live("kiro"); ok {
-			return ms
-		}
-		return []catalog.Model{{ID: "auto", Name: "Auto", Provider: "kiro"}}
-	}
-	acct.fetch = func(ctx context.Context) ([]catalog.Model, error) {
-		a, err := KiroAuthOf(ctx, key, home, false)
-		if err != nil {
-			return nil, err
-		}
-		ms, err := kiroModels(ctx, a)
-		if err != nil {
-			return nil, err
-		}
-		return ms, catalog.SaveLive("kiro", "", ms)
-	}
-	return Provider{ID: "kiro", Name: "Kiro", Icon: "kiro-color", Website: "https://kiro.dev", Key: key, Account: acct}
-}
-
-// KiroModel is what Kiro last said of one of its models: how many tokens a
-// prompt may hold, and whether it takes images; zero and false when it
-// hasn't said.
-func KiroModel(id string) (context int, images bool) {
-	ms, _, _ := catalog.Live("kiro")
-	for _, m := range ms {
-		if m.ID == id {
-			return m.Context, m.Images
-		}
-	}
-	return 0, false
 }

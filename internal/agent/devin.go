@@ -14,17 +14,17 @@ package agent
 import (
 	"context"
 	"errors"
-	"os"
 	"path/filepath"
 	"runtime"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/provider"
 )
 
 func devin(home, cfg string) *Agent {
 	dir := filepath.Join(cfg, "devin")
 	if runtime.GOOS == "windows" {
-		if app := os.Getenv("APPDATA"); app != "" {
+		if app := appdir.Getenv("APPDATA"); app != "" {
 			dir = filepath.Join(app, "devin")
 		}
 	}
@@ -35,7 +35,7 @@ func devin(home, cfg string) *Agent {
 		Bin: "devin", Dir: dir, Path: path,
 		Notice: func() string {
 			if Running(`(^|/)devin( |$)`) {
-				return "Devin reads its model at start-up — restart open Devin sessions to use this."
+				return noticeDevin.String()
 			}
 			return ""
 		},
@@ -153,3 +153,8 @@ func devinOptions(cur string) []Option {
 	}
 	return out
 }
+
+// what devin says after a change (notice.go)
+var (
+	noticeDevin = newNotice("Devin reads its model at start-up — restart open Devin sessions to use this.")
+)

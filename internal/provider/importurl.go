@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"unicode/utf8"
 )
 
 // Import links let a vendor or a relay hand its users a ready-made provider:
@@ -14,7 +15,8 @@ import (
 //
 // Parameters (every value URL-encoded):
 //
-//	preset     a preset id (magpie presets); the preset's endpoints are used
+//	preset     a preset id (magpie presets); the preset's endpoints are used.
+//	           Not google-vertex, asked at the user's own Google Cloud project
 //	region     with a preset that has regions, which one
 //	name       the provider's name; required without a preset
 //	id         its id; derived from the name when absent
@@ -22,6 +24,8 @@ import (
 //	chat       OpenAI Chat Completions base URL (…/v1)
 //	responses  OpenAI Responses base URL (…/v1)
 //	anthropic  Anthropic Messages base URL (the root)
+//	gemini     Google Gemini API base URL (…/v1beta), as the app's editor
+//	           and the TUI take one (#1346, #2201)
 //	models     model ids to show agents, comma separated
 //	catalog    models.dev provider id, for names and reasoning levels
 //	website    the vendor's site; keys: where keys are made
@@ -55,17 +59,21 @@ func ParseImport(link string) (Provider, error) {
 		if p, err = FromPreset(strings.ToLower(id)); err != nil {
 			return Provider{}, err
 		}
+		if p.IsVertex() {
+			// asked at the user's own Google Cloud project, with their
+			// own credentials: nothing a link could hand over
+			return Provider{}, errorf("%s is added with your own Google Cloud project, not from a link: magpie provider add %s project=<id>, or Add in the app", p.Name, VertexPreset)
+		}
 		if r := get("region"); r != "" {
 			found := false
-			for _, reg := range Preset(p.Preset).Regions {
+			pr := Preset(p.Preset)
+			for _, reg := range pr.Regions {
 				if reg.ID == r {
-					p.Chat, p.Responses, p.Anthropic, found = reg.Chat, reg.Responses, reg.Anthropic, true
-					// a region with a key page of its own (Qianfan's pay
-					// as you go, on the IAM page) shows it before the
-					// provider is saved
-					if reg.KeysURL != "" {
-						p.KeysURL = reg.KeysURL
-					}
+					// atRegionOf is where a region's endpoints land: chat,
+					// responses, anthropic and a decision host of its own,
+					// plus that region's key page, docs and catalog
+					p.atRegionOf(pr, reg)
+					found = true
 				}
 			}
 			if !found {
@@ -80,13 +88,13 @@ func ParseImport(link string) (Provider, error) {
 		if p.Name == "" {
 			return Provider{}, errors.New("the link names no provider: it needs preset= or name=")
 		}
-		for k, dst := range map[string]*string{"chat": &p.Chat, "responses": &p.Responses, "anthropic": &p.Anthropic} {
+		for k, dst := range map[string]*string{"chat": &p.Chat, "responses": &p.Responses, "anthropic": &p.Anthropic, "gemini": &p.Gemini} {
 			if *dst, err = endpoint(k, get(k)); err != nil {
 				return Provider{}, err
 			}
 		}
-		if p.Chat == "" && p.Responses == "" && p.Anthropic == "" {
-			return Provider{}, errors.New("the link gives no base URL: it needs chat=, responses= or anthropic=")
+		if p.Chat == "" && p.Responses == "" && p.Anthropic == "" && p.Gemini == "" {
+			return Provider{}, errors.New("the link gives no base URL: it needs chat=, responses=, anthropic= or gemini=")
 		}
 		if p.Catalog != "" && p.Catalog != Slug(p.Catalog) {
 			p.Catalog = ""
@@ -116,8 +124,21 @@ func ParseImport(link string) (Provider, error) {
 	if p.ID == "magpie" {
 		return Provider{}, errors.New(`"magpie" is what agents call the gateway itself; the link needs another id`)
 	}
+	if subscriptionID(p.ID) {
+		// named as a subscription is (claude, kiro): a provider of its own
+		// beside it, never in its place, where the subscription's sign-in
+		// would be lost, or Kiro's take the link's key to its own host
+		// (#1487)
+		p.ID = freeID(p.ID)
+	}
 	if len(p.Name) > 80 {
-		p.Name = p.Name[:80]
+		// 80 bytes at most, cut where a character begins: a name in
+		// Chinese reaches 80 bytes at 27 characters (#2416)
+		cut := 80
+		for cut > 0 && !utf8.RuneStart(p.Name[cut]) {
+			cut--
+		}
+		p.Name = p.Name[:cut]
 	}
 
 	p.Key = get("key")

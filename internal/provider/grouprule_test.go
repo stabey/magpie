@@ -228,6 +228,7 @@ func TestRuledEntry(t *testing.T) {
 // doesn't have is refused.
 func TestSaveGroupRules(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	for _, id := range []string{"a", "b"} {
 		if err := Save(Provider{ID: id, Name: id, Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"m", "big"}}); err != nil {
@@ -251,6 +252,7 @@ func TestSaveGroupRules(t *testing.T) {
 // another group, never itself. Without intents it keeps none.
 func TestSaveGroupClassifier(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	for _, id := range []string{"a", "b"} {
 		if err := Save(Provider{ID: id, Name: id, Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"m", "big"}}); err != nil {
@@ -311,10 +313,10 @@ func TestThenUses(t *testing.T) {
 		{Use: "ai/flash", Images: true},
 	}
 	q := RuleRequest{Images: true, Tokens: 50}
-	if got := ThenUses(rules, q, 1, "codex/gpt"); !slices.Equal(got, []string{"ai/flash"}) {
+	if got := ThenUses(rules, q, 1, []string{"codex/gpt"}); !slices.Equal(got, []string{"ai/flash"}) {
 		t.Fatal(got)
 	}
-	if got := ThenUses(rules, q, 4, "ai/flash"); len(got) != 0 {
+	if got := ThenUses(rules, q, 4, []string{"ai/flash"}); len(got) != 0 {
 		t.Fatal(got)
 	}
 }

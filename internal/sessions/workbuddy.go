@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/yetone/magpie/internal/appdir"
 )
 
 // WorkBuddy (Tencent's desktop agent) keeps its sessions much as Claude
@@ -27,7 +29,7 @@ import (
 
 // WorkBuddyDir is WorkBuddy's folder: $WORKBUDDY_CONFIG_DIR, else ~/.workbuddy.
 func WorkBuddyDir() string {
-	if d := strings.TrimSpace(os.Getenv("WORKBUDDY_CONFIG_DIR")); d != "" {
+	if d := strings.TrimSpace(appdir.Getenv("WORKBUDDY_CONFIG_DIR")); d != "" {
 		return expandHome(d)
 	}
 	home, _ := os.UserHomeDir()
@@ -36,15 +38,51 @@ func WorkBuddyDir() string {
 
 // workbuddyFiles are the sessions under WorkBuddy's projects/, however deep:
 // a session's own <id>.jsonl, and a subagent's under <id>/subagents/.
-func workbuddyFiles() []file {
+func workbuddyFiles() []file { return buddyFiles("workbuddy", WorkBuddyDir()) }
+
+// codebuddyFiles are the same under CodeBuddy Code's projects/: the CLI keeps
+// them as its desktop sibling does, one agent's folder apart (#1779). None
+// when its folder is WorkBuddy's, which workbuddyFiles reads already.
+func codebuddyFiles() []file {
+	if codebuddyInWorkBuddy() {
+		return nil
+	}
+	return buddyFiles("codebuddy", CodeBuddyDir())
+}
+
+// codebuddyInWorkBuddy is whether CodeBuddy Code's folder is WorkBuddy's
+// ($CODEBUDDY_CONFIG_DIR set to ~/.workbuddy, or a link to it). Its sessions
+// are then read once, as WorkBuddy's: read as both, each was listed and
+// counted twice, and one refresh took each path twice (#2932).
+func codebuddyInWorkBuddy() bool { return sameFolder(CodeBuddyDir(), WorkBuddyDir()) }
+
+// sameFolder is whether a and b are one folder on disk, however each is
+// spelled (a link, a letter's case where the disk ignores it). A folder
+// that can't be read is no other.
+func sameFolder(a, b string) bool {
+	x, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	y, err := os.Stat(b)
+	return err == nil && os.SameFile(x, y)
+}
+
+// isBuddy is whether agent keeps its sessions the way WorkBuddy does: its
+// own, or CodeBuddy Code's.
+func isBuddy(agent string) bool { return agent == "workbuddy" || agent == "codebuddy" }
+
+// buddyFiles are the sessions under projects/ in dir, as agent's: WorkBuddy's,
+// or CodeBuddy Code's, which keeps them the same way.
+func buddyFiles(agent, dir string) []file {
 	var out []file
-	filepath.WalkDir(filepath.Join(WorkBuddyDir(), "projects"), func(p string, d os.DirEntry, err error) error {
+	walkLinked(filepath.Join(dir, "projects"), func(p string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
 			return nil
 		}
-		f := file{agent: "workbuddy", key: "workbuddy:" + strings.TrimSuffix(d.Name(), ".jsonl"), path: p, main: true}
+		f := file{agent: agent, key: agent + ":" + strings.TrimSuffix(d.Name(), ".jsonl"), path: p, main: true}
 		if dir := filepath.Dir(p); filepath.Base(dir) == "subagents" {
-			f.key, f.main = "workbuddy:"+filepath.Base(filepath.Dir(dir)), false
+			f.key, f.main = agent+":"+filepath.Base(filepath.Dir(dir)), false
 		}
 		if stat(&f) {
 			out = append(out, f)
@@ -140,7 +178,7 @@ func workbuddyLine(s *state, b []byte, main bool) {
 	case "custom-title":
 		// named by the user: before the one WorkBuddy made
 		if main && l.CustomTitle != "" {
-			s.Title = title(l.CustomTitle)
+			s.Custom = title(l.CustomTitle)
 		}
 	case "ai-title":
 		if main && l.AITitle != "" {

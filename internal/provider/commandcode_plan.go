@@ -1,22 +1,21 @@
 package provider
 
-// A Command Code subscription is a commandcode.ai plan (Pro, GOAT, Max,
-// Ultra — every one but Go comes with API access). Signing in to it, as
-// `cmd auth login` does, mints an API key for the account; that key is
-// served on Command Code's Provider API (/provider/v1: Chat, Responses and
-// Anthropic's Messages) and billed against the plan's own credits and its
-// 5-hour and weekly limits, not as pay-as-you-go.
-//
-// Go has no API access: its key is only taken where the CLI itself asks,
-// POST /alpha/generate, in the CLI's own format (the gateway's
-// commandcode.go). Which plan an account is on is asked of billing/
-// subscriptions, and kept a while (cmdPlanNow).
-//
-// The CLI's own account is read, never changed, from ~/.commandcode/
-// auth.json. Further accounts are signed in by magpie with the CLI's own
-// browser sign-in: commandcode.ai/studio/auth/cli sends the new key to a
-// callback on this machine, which answers as the CLI's does; their keys
-// are kept in logins.json.
+// PLUGIN-SERVED (see AGENTS.md): Command Code's plan ("commandcode-plan")
+// is a retired built-in subscription, served by its plugin alone,
+// @magpie-community/opencode-commandcode-auth (provider.BuiltinRetired).
+// Its sign-in, models, requests and usage are the plugin's; what is left
+// here reads the accounts signed in to the built-in for the move onto the
+// plugin (migrate_side.go), and reads a Command Code key's plan and
+// windows for the keyed preset ("commandcode") and the moved account's
+// card. A fix belongs in the plugin (github.com/magpie-community/plugins,
+// packages/commandcode), with the mover's min raised in
+// internal/provider/migrate_side.go.
+
+// A Command Code subscription is a commandcode.ai plan (Go, Pro, GOAT,
+// Max, Ultra). The CLI's own account is read, never changed, from
+// ~/.commandcode/auth.json; the further accounts the built-in signed in
+// kept their keys in logins.json. Which plan a key is on is asked of
+// billing/subscriptions, its credits and windows of billing/credits.
 //
 // Its id is commandcode-plan: "commandcode" is the keyed preset's, which a
 // provider added with a key from Studio may already have.
@@ -24,23 +23,21 @@ package provider
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/yetone/magpie/internal/catalog"
 )
 
 // CommandCodePlanID is the subscription's id, and its sign-in's.
 const CommandCodePlanID = "commandcode-plan"
+
+// CommandCodeMaxOutput is the most max_tokens Command Code takes at
+// /alpha/generate, for any model: more is refused ("Too big: expected
+// number to be <=200000 at params.max_tokens"). models.dev gives some of
+// its models more (DeepSeek V4's 384000, MiniMax M3's 512000).
+const CommandCodeMaxOutput = 200_000
 
 // Where Command Code's API and its sign-in page are; vars so tests can
 // point them elsewhere.
@@ -48,39 +45,6 @@ var (
 	cmdAPI    = "https://api.commandcode.ai"
 	cmdStudio = "https://commandcode.ai"
 )
-
-// cmdModels are the plan's best-known models, before its list is fetched.
-var cmdModels = []catalog.Model{
-	{ID: "claude-sonnet-5", Name: "Claude Sonnet 5", Context: 1_000_000},
-	{ID: "claude-opus-5-5", Name: "Claude Opus 5.5", Context: 1_000_000},
-	{ID: "gpt-6-sol", Name: "GPT-6 Sol", Context: 1_050_000},
-	{ID: "deepseek/deepseek-v4-pro", Name: "DeepSeek V4 Pro", Context: 1_000_000},
-	{ID: "deepseek/deepseek-v4-flash", Name: "DeepSeek V4 Flash", Context: 1_000_000},
-	{ID: "moonshotai/Kimi-K3", Name: "Kimi K3", Context: 1_000_000},
-	{ID: "zai-org/GLM-5.3", Name: "GLM-5.3", Context: 1_000_000},
-	{ID: "MiniMaxAI/MiniMax-M3", Name: "MiniMax M3", Context: 1_000_000},
-}
-
-// cmdGoModels are the models the Go plan is let use, as the CLI's own
-// table has it (1.72.2): the "opensource" ones, less those it blocks for
-// Go (gpt-5.6-sol, claude-sonnet-5-5, grok-4.6 and the like) —
-//
-//	"individual-go":{allowedCategories:[zr],blockedModels:Qr=[…]}
-//
-// Command Code has no list to ask for them: a model the plan hasn't is
-// refused with MODEL_NOT_IN_PLAN.
-var cmdGoModels = []catalog.Model{
-	{ID: "gpt-6-luna", Name: "GPT-6 Luna", Context: 1_050_000, Images: true, Efforts: []string{"low", "medium", "high", "xhigh", "max"}},
-	{ID: "gpt-5.6-luna", Name: "GPT-5.6 Luna", Context: 1_050_000, Images: true, Efforts: []string{"low", "medium", "high", "xhigh", "max"}},
-	{ID: "deepseek/deepseek-v4-pro", Name: "DeepSeek V4 Pro", Context: 1_000_000, Efforts: []string{"high", "max"}},
-	{ID: "deepseek/deepseek-v4-flash", Name: "DeepSeek V4 Flash", Context: 1_000_000, Efforts: []string{"high", "max"}},
-	{ID: "moonshotai/Kimi-K3", Name: "Kimi K3", Context: 1_000_000, Images: true, Efforts: []string{"low", "high", "max"}},
-	{ID: "zai-org/GLM-5.3", Name: "GLM-5.3", Context: 1_000_000, Efforts: []string{"low", "high", "max"}},
-	{ID: "MiniMaxAI/MiniMax-M3", Name: "MiniMax M3", Context: 1_000_000},
-	{ID: "Qwen/Qwen3.8-Max", Name: "Qwen 3.8 Max", Context: 1_000_000, Images: true, Efforts: []string{"low", "medium", "xhigh"}},
-	{ID: "Qwen/Qwen3.8-Flash", Name: "Qwen 3.8 Flash", Context: 1_000_000},
-	{ID: "xiaomi/mimo-v2.6-pro", Name: "MiMo V2.6 Pro", Context: 1_048_576, Images: true},
-}
 
 // cmdAuth is an account's key, as auth.json and the sign-in name it.
 type cmdAuth struct {
@@ -146,154 +110,11 @@ func cmdLogins() []cmdLogin {
 	return out
 }
 
-func cmdSide() []sideLogin {
-	var out []sideLogin
-	for _, l := range cmdLogins() {
-		out = append(out, sideLogin{Login: l.Login})
-	}
-	return out
-}
-
-func cmdLoginList() []Login { return loginsOf(cmdSide()) }
-
-func switchCommandCodeLogin(user string) error {
-	return switchSideLogin(CommandCodePlanID, user, cmdSide())
-}
-
-func setCommandCodeLoginOn(user string, on bool) error {
-	return setSideLoginOn(CommandCodePlanID, user, on, cmdSide())
-}
-
-func forgetCommandCodeLogin(user string) error {
-	return forgetSideLogin(CommandCodePlanID, user, cmdSide(), nil)
-}
-
-func commandCodeAccount() (Provider, bool) {
-	ls := cmdLogins()
-	if len(ls) == 0 {
-		return Provider{}, false
-	}
-	return cmdProvider(ls[0].User, ls[0].Plan, ls[0].auth), true
-}
-
-// commandCodeAlsoOn is the Command Code accounts in use behind the first.
-func commandCodeAlsoOn() []Provider {
-	var out []Provider
-	for _, l := range cmdLogins() {
-		if !l.Active && l.On {
-			out = append(out, cmdProvider(l.User, l.Plan, l.auth))
-		}
-	}
-	return out
-}
-
-func cmdProvider(who, plan string, a cmdAuth) Provider {
-	p := Provider{ID: CommandCodePlanID, Name: "Command Code Plan", Icon: "commandcode",
-		Chat: cmdAPI + "/provider/v1", Responses: cmdAPI + "/provider/v1", Anthropic: cmdAPI + "/provider",
-		Website: cmdStudio}
-	acct := &Account{Agent: CommandCodePlanID, User: who, Plan: cmdPlanKnown(a, plan)}
-	acct.sign = func(ctx context.Context, req *http.Request, body []byte) error {
-		req.Header.Del("Authorization")
-		req.Header.Set("Authorization", "Bearer "+a.APIKey)
-		req.Header.Set("x-api-key", a.APIKey)
-		return nil
-	}
-	acct.models = func() []catalog.Model {
-		if cmdPlanKnown(a, plan) == "Go" {
-			return cmdGoModels
-		}
-		return cmdModels
-	}
-	// the plan's list is the Provider API's, with what each model is
-	// served on; it is asked as a keyed provider's is. Go's key has no
-	// Provider API: its list is the CLI's.
-	acct.fetch = func(ctx context.Context) ([]catalog.Model, error) {
-		if cmdPlanNow(ctx, a, plan) == "Go" {
-			return cmdGoModels, nil
-		}
-		keyed := p
-		keyed.Account, keyed.Key = nil, a.APIKey
-		return keyed.Fetch(ctx)
-	}
-	acct.generate = func(ctx context.Context) (string, bool) {
-		return a.APIKey, cmdPlanNow(ctx, a, plan) == "Go"
-	}
-	p.Account = acct
-	return p
-}
-
-// CommandCodeGenerate says whether p is a Command Code account on the Go
-// plan, which is asked at api+"/alpha/generate" in the CLI's own format
-// rather than on the Provider API, with key; ok is false for every other
-// account and provider.
-func CommandCodeGenerate(ctx context.Context, p Provider) (api, key string, ok bool) {
-	if p.Account == nil || p.Account.generate == nil {
-		return "", "", false
-	}
-	if key, ok = p.Account.generate(ctx); !ok {
-		return "", "", false
-	}
-	return cmdAPI, key, true
-}
-
 // ---- which plan ---------------------------------------------------------------
-
-// cmdPlansSeen is each key's plan, as billing/subscriptions last said
-// ("" when it couldn't be read), and when.
-var cmdPlansSeen = struct {
-	sync.Mutex
-	m map[string]cmdSeen
-}{m: map[string]cmdSeen{}}
 
 type cmdSeen struct {
 	plan string
 	at   time.Time
-}
-
-// How long a plan read is kept, and a failure to read it before it is
-// asked again.
-var (
-	cmdPlanKeep  = 10 * time.Minute
-	cmdPlanRetry = time.Minute
-)
-
-// cmdRemember keeps what billing/subscriptions said of a key's plan.
-func cmdRemember(key, plan string) {
-	cmdPlansSeen.Lock()
-	cmdPlansSeen.m[key] = cmdSeen{plan, time.Now()}
-	cmdPlansSeen.Unlock()
-}
-
-// cmdPlanKnown is the account's plan as last read, else saved (the one
-// its sign-in said), asking no one.
-func cmdPlanKnown(a cmdAuth, saved string) string {
-	cmdPlansSeen.Lock()
-	seen := cmdPlansSeen.m[a.APIKey]
-	cmdPlansSeen.Unlock()
-	return firstNonEmpty(seen.plan, saved)
-}
-
-// cmdPlanNow is the account's plan, read again once what was read is
-// older than cmdPlanKeep; saved while it can't be read. The CLI's own
-// account has none saved, so it is always asked.
-func cmdPlanNow(ctx context.Context, a cmdAuth, saved string) string {
-	cmdPlansSeen.Lock()
-	seen, ok := cmdPlansSeen.m[a.APIKey]
-	cmdPlansSeen.Unlock()
-	switch {
-	case ok && seen.plan != "" && time.Since(seen.at) < cmdPlanKeep:
-		return seen.plan
-	case ok && seen.plan == "" && time.Since(seen.at) < cmdPlanRetry:
-		return saved
-	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	_, plan, _, _, read := cmdSubscription(ctx, a)
-	if !read {
-		plan = ""
-	}
-	cmdRemember(a.APIKey, plan)
-	return firstNonEmpty(plan, saved)
 }
 
 // ---- allowance ----------------------------------------------------------------
@@ -446,29 +267,6 @@ func cmdQuotaOf(q SubscriptionQuota, c cmdCredits) SubscriptionQuota {
 	return q
 }
 
-func cmdQuota(ctx context.Context, l Login, a cmdAuth) SubscriptionQuota {
-	q := SubscriptionQuota{Provider: CommandCodePlanID, Name: "Command Code", Icon: "commandcode", Plan: l.Plan, User: l.User, Windows: []QuotaWindow{}}
-	// the plan is said even while the credits can't be read (Command Code
-	// answers 503, "Couldn't verify your credit balance just now", at times)
-	id, plan, until, renew, planOK := cmdSubscription(ctx, a)
-	var c cmdCredits
-	if err := accountJSON(ctx, cmdAPI+"/alpha/billing/credits", a.APIKey, nil, &c); err != nil {
-		q.Error = err.Error()
-	} else {
-		// billing/credits leaves the plan out: the month of credits the pool
-		// is made of is the subscription's plan's
-		if c.Credits.PlanID == "" {
-			c.Credits.PlanID = id
-		}
-		q = cmdQuotaOf(q, c)
-	}
-	if planOK {
-		q.Plan, q.Until, q.Renew = plan, until, renew
-		cmdRemember(a.APIKey, plan)
-	}
-	return q
-}
-
 // cmdNoPlan is the plan of an account with no subscription: its key is
 // billed against the credits it bought, if any.
 const cmdNoPlan = "No plan"
@@ -478,14 +276,15 @@ const cmdNoPlan = "No plan"
 // none. ok is false when that can't be read.
 func cmdSubscription(ctx context.Context, a cmdAuth) (id, plan string, until *time.Time, renew string, ok bool) {
 	var r struct {
-		Data *struct {
+		Success *bool `json:"success"` // false when Command Code couldn't tell ("write CONNECTION_CLOSED …"), though a 200
+		Data    *struct {
 			PlanID           string `json:"planId"`
 			Status           string `json:"status"`
 			CurrentPeriodEnd any    `json:"currentPeriodEnd"`
 			CancelAtEnd      *bool  `json:"cancelAtPeriodEnd"`
 		} `json:"data"`
 	}
-	if accountJSON(ctx, cmdAPI+"/alpha/billing/subscriptions", a.APIKey, nil, &r) != nil {
+	if accountJSON(ctx, cmdAPI+"/alpha/billing/subscriptions", a.APIKey, nil, &r) != nil || (r.Success != nil && !*r.Success) {
 		return "", "", nil, "", false
 	}
 	if d := r.Data; d != nil && d.PlanID != "" && d.Status != "canceled" && d.Status != "incomplete_expired" {
@@ -497,208 +296,55 @@ func cmdSubscription(ctx context.Context, a cmdAuth) (id, plan string, until *ti
 	return "", cmdNoPlan, nil, "", true
 }
 
-func cmdLoginQuota(ctx context.Context, l Login) SubscriptionQuota {
-	for _, c := range cmdLogins() {
-		if strings.EqualFold(c.User, l.User) {
-			return cmdQuota(ctx, l, c.auth)
-		}
+// cmdKeyWindows is a Command Code key's plan card (#2451): the plan's
+// 5-hour and weekly windows, and its month of credits as one more, as
+// the signed-in subscription's card has them. billing/credits leaves the
+// plan out, so it is the key's subscription's, read at most every ten
+// minutes (billing/subscriptions takes 15–20 seconds at times), and the
+// one read before while it can't be read. A key with no windows is a
+// pay-as-you-go key: no plan, and no card.
+func cmdKeyWindows(ctx context.Context, src planQuotaSource, key string) (string, []QuotaWindow, error) {
+	b, err := planBody(ctx, src, key)
+	if err != nil {
+		return "", nil, err
 	}
-	return SubscriptionQuota{Provider: CommandCodePlanID, Plan: l.Plan, Windows: []QuotaWindow{}, Error: "not signed in"}
+	var c cmdCredits
+	if err := json.Unmarshal(b, &c); err != nil {
+		return "", nil, err
+	}
+	if len(cmdWindows(c)) == 0 {
+		return cmdPlanName(c.Credits.PlanID), []QuotaWindow{}, nil
+	}
+	if c.Credits.PlanID == "" {
+		c.Credits.PlanID = cmdKeyPlanID(ctx, key)
+	}
+	q := cmdQuotaOf(SubscriptionQuota{}, c)
+	return q.Plan, q.Windows, nil
+}
+
+var cmdKeyPlans = struct {
+	sync.Mutex
+	m map[string]cmdSeen // plan is the subscription's id here
+}{m: map[string]cmdSeen{}}
+
+func cmdKeyPlanID(ctx context.Context, key string) string {
+	cmdKeyPlans.Lock()
+	seen, had := cmdKeyPlans.m[key]
+	cmdKeyPlans.Unlock()
+	if had && time.Since(seen.at) < 10*time.Minute {
+		return seen.plan
+	}
+	id, _, _, _, ok := cmdSubscription(ctx, cmdAuth{APIKey: key})
+	if !ok {
+		return seen.plan
+	}
+	cmdKeyPlans.Lock()
+	cmdKeyPlans.m[key] = cmdSeen{id, time.Now()}
+	cmdKeyPlans.Unlock()
+	return id
 }
 
 // ---- signing in ---------------------------------------------------------------
 
-// startCommandCodeSignIn is the CLI's browser sign-in: Studio asks the
-// user to approve a key for this machine, then posts it (a form, or JSON
-// from an older Studio) to the callback, which sends the browser on to a
-// page saying it is done.
-func startCommandCodeSignIn(s *signInFlow) error {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return err
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	q := url.Values{}
-	q.Set("callback", fmt.Sprintf("http://127.0.0.1:%d/callback", port))
-	q.Set("state", s.state)
-	q.Set("mode", "redirect")
-	srv := &http.Server{Handler: http.HandlerFunc(s.commandCodeCallback), ReadHeaderTimeout: 10 * time.Second}
-	s.mu.Lock()
-	s.st.URL = cmdStudio + "/studio/auth/cli?" + q.Encode()
-	s.srv = srv
-	s.mu.Unlock()
-	go func() { _ = srv.Serve(ln) }()
-	return nil
-}
-
-// cmdWhoamiWait is how long a sign-in waits to ask whoami again.
-var cmdWhoamiWait = time.Second
-
-// cmdOrigins are the Studio pages that may post to the callback.
-var cmdOrigins = []string{"https://commandcode.ai", "https://staging.commandcode.ai"}
-
-func (s *signInFlow) commandCodeCallback(w http.ResponseWriter, r *http.Request) {
-	origin := cmdOrigins[0]
-	for _, o := range cmdOrigins {
-		if r.Header.Get("Origin") == o {
-			origin = o
-		}
-	}
-	w.Header().Set("Access-Control-Allow-Origin", origin)
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-	if r.Header.Get("Access-Control-Request-Private-Network") == "true" {
-		w.Header().Set("Access-Control-Allow-Private-Network", "true")
-	}
-	switch {
-	case r.Method == http.MethodOptions:
-		w.WriteHeader(http.StatusNoContent)
-		return
-	case r.URL.Path == "/callback/complete" && r.Method == http.MethodGet:
-		st := s.status()
-		if st.State == "done" {
-			signInPage(w, true, "You're signed in", fmt.Sprintf("%s is added to magpie. You can close this tab.", st.User))
-		} else {
-			signInPage(w, false, "Sign-in didn't finish", firstNonEmpty(st.Error, "Start it again from magpie."))
-		}
-		return
-	case r.URL.Path == "/cancel":
-		s.finish(SignInState{State: "canceled"})
-		w.WriteHeader(http.StatusNoContent)
-		return
-	case r.URL.Path != "/callback":
-		http.NotFound(w, r)
-		return
-	case r.Method != http.MethodPost:
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	body, _ := io.ReadAll(io.LimitReader(r.Body, 10_000))
-	var got struct {
-		cmdAuth
-		State string `json:"state"`
-		Error string `json:"error"`
-		Desc  string `json:"error_description"`
-	}
-	isJSON := strings.HasPrefix(strings.TrimSpace(strings.ToLower(r.Header.Get("Content-Type"))), "application/json")
-	if isJSON {
-		_ = json.Unmarshal(body, &got)
-	} else {
-		f, _ := url.ParseQuery(string(body))
-		got.APIKey, got.UserID, got.UserName, got.KeyName = f.Get("apiKey"), f.Get("userId"), f.Get("userName"), f.Get("keyName")
-		got.State, got.Error, got.Desc = f.Get("state"), f.Get("error"), f.Get("error_description")
-	}
-	answer := func(ok bool, msg string) {
-		if isJSON {
-			w.Header().Set("Content-Type", "application/json")
-			if !ok {
-				w.WriteHeader(http.StatusBadRequest)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"success": ok, "error": msg})
-			return
-		}
-		// as the CLI answers: on to the page that says how it went
-		w.Header().Set("Location", "/callback/complete?state="+url.QueryEscape(got.State))
-		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(http.StatusSeeOther)
-	}
-	if got.State != s.state {
-		// not ours: someone else's page, or a stale tab
-		w.WriteHeader(http.StatusForbidden)
-		signInPage(w, false, "This link isn't from magpie's sign-in", "Start it again from magpie.")
-		return
-	}
-	if s.status().State != "waiting" {
-		answer(false, "this sign-in is over")
-		return
-	}
-	if got.Error != "" {
-		msg := firstNonEmpty(got.Desc, got.Error)
-		if got.Error == "access_denied" {
-			msg = "the sign-in was denied"
-		}
-		s.finish(SignInState{State: "failed", Error: msg})
-		answer(false, msg)
-		return
-	}
-	if got.APIKey == "" {
-		answer(false, "Command Code sent back no key")
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-	who, plan, err := cmdSignedIn(ctx, got.cmdAuth)
-	if err != nil {
-		s.finish(SignInState{State: "failed", Error: err.Error()})
-		answer(false, err.Error())
-		return
-	}
-	a := got.cmdAuth
-	a.UserName = who
-	auth, _ := json.Marshal(a)
-	ownUser, _, hasOwn := cmdOwn()
-	if !hasOwn {
-		ownUser = ""
-	}
-	if err := addSideLogin(savedLogin{Agent: CommandCodePlanID, User: who, Plan: plan, Auth: auth}, ownUser, func(savedLogin) {}); err != nil {
-		s.finish(SignInState{State: "failed", Error: err.Error()})
-		answer(false, err.Error())
-		return
-	}
-	// the browser comes back for its page after this: the server stays up
-	// a while for it, where finish would close it within a second
-	s.mu.Lock()
-	srv := s.srv
-	s.srv = nil
-	s.mu.Unlock()
-	if srv != nil {
-		time.AfterFunc(10*time.Second, func() { _ = srv.Close() })
-	}
-	s.finish(SignInState{State: "done", User: who, Plan: plan, Using: hasOwn && strings.EqualFold(ownUser, who)})
-	answer(true, "")
-}
-
-// cmdSignedIn names a new key's account with whoami, and reads its plan.
-// Only whoami turning the key down (401, 403) fails the sign-in: the CLI's
-// own browser sign-in keeps the key Studio posts without asking whoami at
-// all, and whoami has answered a key just made with a 500, so a whoami
-// that errs is asked again a few times and then passed over for the name
-// Studio sent with the key.
-func cmdSignedIn(ctx context.Context, a cmdAuth) (who, plan string, err error) {
-	var me struct {
-		User struct {
-			ID       string `json:"id"`
-			UserName string `json:"userName"`
-			Name     string `json:"name"`
-			Email    string `json:"email"`
-		} `json:"user"`
-	}
-	for try := 0; ; try++ {
-		err := accountJSON(ctx, cmdAPI+"/alpha/whoami", a.APIKey, nil, &me)
-		var st *accountStatusError
-		if err == nil {
-			break
-		}
-		if errors.As(err, &st) && (st.status == http.StatusUnauthorized || st.status == http.StatusForbidden) {
-			return "", "", fmt.Errorf("Command Code didn't take the new key: %w", err)
-		}
-		if try == 2 || ctx.Err() != nil {
-			if firstNonEmpty(a.UserName, a.UserID) == "" {
-				return "", "", fmt.Errorf("Command Code couldn't say which account signed in: %w", err)
-			}
-			break
-		}
-		select {
-		case <-ctx.Done():
-		case <-time.After(cmdWhoamiWait):
-		}
-	}
-	who = firstNonEmpty(me.User.UserName, a.UserName, me.User.Email, me.User.ID, a.UserID)
-	if who == "" {
-		return "", "", fmt.Errorf("Command Code didn't say which account signed in")
-	}
-	if _, p, _, _, ok := cmdSubscription(ctx, a); ok {
-		plan = p
-	}
-	return who, plan, nil
-}
+// cmdKeysURL is Studio's page of API keys, where one is made to paste.
+var cmdKeysURL = "https://commandcode.ai/settings/keys"

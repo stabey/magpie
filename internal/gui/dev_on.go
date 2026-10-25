@@ -197,7 +197,12 @@ func (c remoteWindows) post(op string, form url.Values) string {
 func (c remoteWindows) HidePanel()           { c.do("hide", "") }
 func (c remoteWindows) ShowMain(view string) { c.do("main", view) }
 func (c remoteWindows) Quit()                { c.do("quit", "") }
-func (c remoteWindows) OpenURL(u string)     { c.do("open", u) }
+func (c remoteWindows) OpenURL(u string) error {
+	if s := c.post("open", url.Values{"arg": {u}}); s != "ok" && s != "" {
+		return fmt.Errorf("%s", s)
+	}
+	return nil
+}
 func (c remoteWindows) OpenFolder(path string) error {
 	if s := c.post("reveal", url.Values{"arg": {path}}); s != "ok" {
 		return fmt.Errorf("%s", s)
@@ -229,6 +234,13 @@ func (c remoteWindows) FitPanel(height int, g Glide) {
 func (c remoteWindows) TintPanel(rgba [4]uint8, ms int) bool {
 	q := url.Values{"c": {fmt.Sprintf("%d,%d,%d,%d", rgba[0], rgba[1], rgba[2], rgba[3])}, "ms": {strconv.Itoa(ms)}}
 	return c.post("tint", url.Values{"arg": {q.Encode()}}) == "ok"
+}
+func (c remoteWindows) TintTitleBar(rgba [4]uint8, dark bool) bool {
+	q := url.Values{"c": {fmt.Sprintf("%d,%d,%d,%d", rgba[0], rgba[1], rgba[2], rgba[3])}}
+	if dark {
+		q.Set("dark", "1")
+	}
+	return c.post("titlebar", url.Values{"arg": {q.Encode()}}) == "ok"
 }
 func (c remoteWindows) SetTextSize(percent int) {
 	c.post("textsize", url.Values{"arg": {strconv.Itoa(percent)}})
@@ -272,7 +284,12 @@ func devShell(h *host) http.Handler {
 		case "quit":
 			h.Quit()
 		case "open":
-			h.OpenURL(arg)
+			if err := h.OpenURL(arg); err != nil {
+				rw.Write([]byte(err.Error()))
+				return
+			}
+			rw.Write([]byte("ok"))
+			return
 		case "reveal":
 			if err := h.OpenFolder(arg); err != nil {
 				rw.Write([]byte(err.Error()))
@@ -305,6 +322,12 @@ func devShell(h *host) http.Handler {
 		case "tint":
 			q, _ := url.ParseQuery(arg)
 			if c, ms, ok := parseTint(q); ok && h.TintPanel(c, ms) {
+				rw.Write([]byte("ok"))
+				return
+			}
+		case "titlebar":
+			q, _ := url.ParseQuery(arg)
+			if c, _, ok := parseTint(q); ok && h.TintTitleBar(c, q.Get("dark") == "1") {
 				rw.Write([]byte("ok"))
 				return
 			}

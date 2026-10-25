@@ -15,15 +15,16 @@ func TestSet(t *testing.T) {
 	}
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", home+"/.config")
 	t.Setenv("APPIMAGE", "/opt/my apps/magpie.AppImage")
-	if Enabled() {
+	if Enabled() != Off {
 		t.Fatal("on before it was turned on")
 	}
 	if err := Set(true); err != nil {
 		t.Fatal(err)
 	}
-	if !Enabled() {
+	if Enabled() == Off {
 		t.Fatal("not on after Set(true)")
 	}
 	path := record()
@@ -31,12 +32,16 @@ func TestSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"/opt/my apps/magpie.AppImage", Arg} {
+	arg := Arg
+	if runtime.GOOS == "android" {
+		arg = "serve"
+	}
+	for _, want := range []string{"/opt/my apps/magpie.AppImage", arg} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("%s lacks %q:\n%s", path, want, b)
 		}
 	}
-	if err := Set(false); err != nil || Enabled() {
+	if err := Set(false); err != nil || Enabled() != Off {
 		t.Fatalf("still on after Set(false): %v", err)
 	}
 	if err := Set(false); err != nil {

@@ -81,6 +81,7 @@ func TestPiResponsesRelayed(t *testing.T) {
 func TestPiResponsesRelayedToChatGPT(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	claims := func(m map[string]any) string {
@@ -91,7 +92,7 @@ func TestPiResponsesRelayedToChatGPT(t *testing.T) {
 	auth := fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"id_token":%q,"access_token":%q,"refresh_token":"r","account_id":"acct-1"}}`,
 		claims(map[string]any{"email": "me@example.com"}), claims(map[string]any{"exp": time.Now().Add(time.Hour).Unix()}))
 	os.WriteFile(filepath.Join(home, ".codex", "auth.json"), []byte(auth), 0o600)
-	f := &fake{t: t, ctype: "none", reply: piReply}
+	f := &fake{t: t, ctype: "none", reply: piReply, refuse: codexBackendRefuses}
 	up := httptest.NewServer(f)
 	defer up.Close()
 	old := provider.CodexBase
@@ -108,5 +109,64 @@ func TestPiResponsesRelayedToChatGPT(t *testing.T) {
 	}
 	if ins, _ := got["instructions"].(string); !strings.HasPrefix(ins, "You are Codex") {
 		t.Errorf("instructions: %q", ins)
+	}
+}
+
+// codexBackendRefuses answers as the ChatGPT backend does an input item
+// with a parameter its kind doesn't have: a message without its id is an
+// input message, and an input message has no status (Doby on Discord, Pi
+// 1.4.0 going on with a conversation: 400 "Unknown parameter:
+// 'input[8].status'").
+func codexBackendRefuses(body []byte) (int, string) {
+	var q struct {
+		Input []map[string]any `json:"input"`
+	}
+	if json.Unmarshal(body, &q) != nil {
+		return 400, `{"error":{"message":"bad json","type":"invalid_request_error"}}`
+	}
+	for i, it := range q.Input {
+		_, id := it["id"]
+		_, status := it["status"]
+		if typ := it["type"]; status && !id && (typ == nil || typ == "message") {
+			p := fmt.Sprintf("input[%d].status", i)
+			return 400, fmt.Sprintf(`{"error":{"message":"Unknown parameter: '%s'.","type":"invalid_request_error","param":"%s","code":"unknown_parameter"}}`, p, p)
+		}
+	}
+	return 0, ""
+}
+
+// DeepSeek Harness on magpie's route switched to OpenAI Responses (its
+// llm-pi-ai plugin is pi-ai's openai-responses, so it asks as Pi does)
+// reaches a model served on Chat Completions alone, a DeepSeek one: the
+// gateway asks it in Chat, the effort as reasoning_effort, the image, tool
+// call and its output carried over, and dsh gets Responses events back.
+func TestDshResponsesReachChatVendor(t *testing.T) {
+	f := &fake{t: t, reply: sse(
+		`data: {"id":"c1","model":"m1","choices":[{"delta":{"role":"assistant","content":"a cat"}}]}`,
+		`data: {"id":"c1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":2}}`,
+		`data: [DONE]`)}
+	setup(t, provider.Chat, f)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(fmt.Sprintf(piResponses, "fake/m1")))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer magpie")
+	req.Header.Set("User-Agent", "deepseek-harness/0.2.0")
+	New().Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if rec.Code != 200 || !strings.Contains(body, "response.output_text.delta") || !strings.Contains(body, "a cat") || !strings.Contains(body, "response.completed") {
+		t.Fatalf("reply: %d %s", rec.Code, body)
+	}
+	var up map[string]any
+	if err := json.Unmarshal(f.got, &up); err != nil {
+		t.Fatalf("upstream body: %s", f.got)
+	}
+	if f.path != "/v1/chat/completions" || up["model"] != "m1" || up["reasoning_effort"] != "high" || up["stream"] != true {
+		t.Errorf("asked: %s %s", f.path, f.got)
+	}
+	s := string(f.got)
+	for _, want := range []string{`You are Pi.`, `data:image/png;base64,iVBORw0KGgo=`, `"tool_calls"`, `"call_1"`, `"tool_call_id"`, `"name":"read"`} {
+		if !strings.Contains(s, want) {
+			t.Errorf("upstream lost %s: %s", want, s)
+		}
 	}
 }

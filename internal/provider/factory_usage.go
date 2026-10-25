@@ -1,5 +1,11 @@
 package provider
 
+// PLUGIN-SERVED (see AGENTS.md): Factory ("factory") is a retired built-in
+// subscription, served by its plugin alone,
+// @magpie-community/opencode-factory-auth (provider.BuiltinRetired). What
+// is left here reads /api/billing/limits for tests of the gateway's pool
+// routing (FactoryAllowanceForTest).
+
 // How much of a Factory plan an account has used, as droid's /status asks
 // it: GET /api/billing/limits. Standard usage runs in rolling 5-hour, weekly
 // and monthly windows, each a percent used and when it ends; Droid Core, the
@@ -7,9 +13,7 @@ package provider
 // balance in cents.
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -93,33 +97,12 @@ func factoryQuota(l factoryLimits) []QuotaWindow {
 	return out
 }
 
-func factoryLoginQuota(ctx context.Context, l Login) SubscriptionQuota {
-	q := SubscriptionQuota{Provider: "factory", Name: "Factory", Icon: "factory",
-		Plan: l.Plan, User: l.User, Windows: []QuotaWindow{}}
-	c, err := factoryFresh(ctx, l.User)
-	if err != nil {
-		q.Error = err.Error()
-		return q
+// FactoryAllowanceForTest is the allowance an account's /api/billing/limits
+// answer gives routing, for the gateway's tests.
+func FactoryAllowanceForTest(limits []byte, now time.Time) Allowance {
+	var l factoryLimits
+	if json.Unmarshal(limits, &l) != nil {
+		return nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	var lim factoryLimits
-	err = factoryGet(ctx, c, "/api/billing/limits", nil, &lim)
-	var st *factoryStatus
-	if errors.As(err, &st) && factoryMendOrg(ctx, l.User, st.Code, []byte(st.Msg)) {
-		// the org it named was put right: ask once more
-		if c, err = factoryFresh(ctx, l.User); err == nil {
-			err = factoryGet(ctx, c, "/api/billing/limits", nil, &lim)
-		}
-	}
-	if err != nil {
-		q.Error = err.Error()
-		return q
-	}
-	if lim.Limits.Standard == nil {
-		q.Error = "Factory: the account reported no limits"
-		return q
-	}
-	q.Windows = factoryQuota(lim)
-	return q
+	return allowanceOf(factoryQuota(l), now)
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/yetone/magpie/internal/filelock"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -28,13 +29,13 @@ func lock(ctx context.Context) (unlock func(), err error) {
 		return func() {}, nil // no lock to be had here: sync as before there was one
 	}
 	for {
-		got, err := tryLock(f)
+		got, err := filelock.TryLock(f)
 		if err != nil { // a file system without locks, as an NFS home with no lockd
 			f.Close()
 			return func() {}, nil
 		}
 		if got {
-			return func() { unlockFile(f); f.Close() }, nil
+			return func() { filelock.Unlock(f); f.Close() }, nil
 		}
 		select {
 		case <-ctx.Done():
@@ -48,8 +49,8 @@ func lock(ctx context.Context) (unlock func(), err error) {
 	}
 }
 
-// wait is how long Configure, Off and Dismiss wait for a sync in progress:
-// less than the Settings page gives a request.
+// wait is how long Configure, Off, Dismiss and a sync wait for a sync in
+// progress, which itself has no time limit (see stallAfter).
 const wait = 30 * time.Second
 
 // locked runs fn holding the lock, then mu, after a sync in progress: it

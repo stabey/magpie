@@ -49,18 +49,29 @@ func codexSign(token func(context.Context) (tok, accountID string, err error)) f
 			return nil
 		}
 		req.Header.Set("Accept", "text/event-stream")
-		var v struct {
-			Key string `json:"prompt_cache_key"`
-		}
-		json.Unmarshal(body, &v)
-		if v.Key != "" {
-			req.Header.Set("session_id", v.Key)
-			req.Header.Set("conversation_id", v.Key)
-		} else {
-			req.Header.Del("session_id")
-			req.Header.Del("conversation_id")
-		}
+		sessionHeaders(req.Header, body)
 		return nil
+	}
+}
+
+// sessionHeaders names the conversation body belongs to (its
+// prompt_cache_key) in the headers Codex CLI 0.162 sends it in, session-id
+// and thread-id. The ChatGPT backend finds a conversation's cached prompt
+// by them, not by the body's key: on a real account a request with tools
+// and the key alone was cached 0 tokens six times in a row, and 7552 of
+// 7659 from the second on with the headers (#1473). The underscored names
+// older Codex sent go no more, since a proxy may drop a header named with
+// an underscore. A body without a key leaves the session the client named.
+func sessionHeaders(h http.Header, body []byte) {
+	h.Del("session_id")
+	h.Del("conversation_id")
+	var v struct {
+		Key string `json:"prompt_cache_key"`
+	}
+	json.Unmarshal(body, &v)
+	if v.Key != "" {
+		h.Set("session-id", v.Key)
+		h.Set("thread-id", v.Key)
 	}
 }
 
@@ -227,12 +238,7 @@ func codexInstructions(model string) string {
 	}); ok {
 		return s
 	}
-	dir := os.Getenv("CODEX_HOME")
-	if dir == "" {
-		home, _ := os.UserHomeDir()
-		dir = filepath.Join(home, ".codex")
-	}
-	if s, ok := codexCLIPrompts.get(filepath.Join(dir, "models_cache.json"), model, codexPrompts); ok {
+	if s, ok := codexCLIPrompts.get(catalog.CodexModelsCache(), model, codexPrompts); ok {
 		return s
 	}
 	return codexcat.Prompt
@@ -241,7 +247,8 @@ func codexInstructions(model string) string {
 // codexBody makes a Responses request the one Codex CLI would send: it
 // streams only, keeps nothing (so its items carry no ids), carries Codex's
 // instructions — the client's own riding first in the input — and rejects
-// the sampling knobs and any service tier but Fast's.
+// the sampling knobs, explicit cache options and any service tier but
+// Fast's and Ultrafast's.
 func codexBody(body []byte) []byte {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
@@ -249,11 +256,17 @@ func codexBody(body []byte) []byte {
 	if dec.Decode(&m) != nil || m == nil {
 		return body
 	}
-	for _, k := range []string{"max_output_tokens", "max_completion_tokens", "temperature", "top_p", "previous_response_id", "user", "safety_identifier"} {
+	// prompt_cache_options, which pi-ai sends as {"mode":"explicit"}: the
+	// ChatGPT backend turns it away on every model it serves ("is not
+	// supported on this model", 400, tried 2026-10-14 on gpt-5.5,
+	// gpt-5.6-sol, gpt-6-sol, gpt-6-astra and gpt-6-luna, #2154); its
+	// cache follows the session-id header instead (#1473)
+	for _, k := range []string{"max_output_tokens", "max_completion_tokens", "temperature", "top_p", "previous_response_id", "user", "safety_identifier", "prompt_cache_options"} {
 		delete(m, k)
 	}
-	// Codex's Fast mode sends "priority"; any other tier stays out
-	if m["service_tier"] != "priority" {
+	// Codex's Fast mode sends "priority", its Ultrafast "ultrafast"; any
+	// other tier stays out
+	if t := m["service_tier"]; t != "priority" && t != "ultrafast" {
 		delete(m, "service_tier")
 	}
 	model, _ := m["model"].(string)
@@ -291,6 +304,7 @@ func codexBody(body []byte) []byte {
 	m["store"] = false
 	m["stream"] = true
 	m["tool_choice"] = "auto"
+	declareSearch(m, false)
 	if _, ok := m["parallel_tool_calls"]; !ok {
 		m["parallel_tool_calls"] = true
 	}
@@ -351,8 +365,23 @@ func conversationKey(instructions string, input []any) string {
 	return s[:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:32]
 }
 
+// BoundCallID is a call's id as the ChatGPT backend takes one: as it is
+// when it fits its 64 characters, else the sha256 of it (trimmed, as calls
+// and their outputs are paired), 64 hex characters. Foreign providers can
+// join two ids into one longer than that (#732, congee949: 86 and 87); the
+// same id gives the same hash on every request, so a call and its output
+// stay paired, and two ids that differ are never cut down alike.
+func BoundCallID(id string) string {
+	if len(id) <= 64 {
+		return id
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(id)))
+	return hex.EncodeToString(sum[:])
+}
+
 // codexInput makes input items fit a request that keeps nothing: no
-// references to stored items, no ids, a tool's output without its call
+// references to stored items, no ids (nor a message's status, which goes
+// with its id), a tool's output without its call
 // kept as a message saying what it was, and no system role, which the
 // backend rejects (developer keeps what it means in its place).
 func codexInput(input []any) []any {
@@ -360,6 +389,13 @@ func codexInput(input []any) []any {
 	for _, item := range input {
 		it, _ := item.(map[string]any)
 		id, _ := it["call_id"].(string)
+		switch it["type"] {
+		case "function_call", "function_call_output", "local_shell_call", "local_shell_call_output", "custom_tool_call", "custom_tool_call_output", "tool_search_call", "tool_search_output":
+			if b := BoundCallID(id); b != id {
+				id = b
+				it["call_id"] = id
+			}
+		}
 		switch it["type"] {
 		case "function_call":
 			calls[strings.TrimSpace(id)] = "function_call_output"
@@ -379,7 +415,22 @@ func codexInput(input []any) []any {
 		if it["type"] == "item_reference" {
 			continue
 		}
+		// Codex delivers standalone notifications without a call ID. The
+		// native backend understands their name/namespace and item ID;
+		// they are not historical results whose calls have gone missing.
+		if (it["type"] == "function_call_output" || it["type"] == "custom_tool_call_output") && (it["call_id"] == nil || it["call_id"] == "") {
+			out = append(out, it)
+			continue
+		}
 		delete(it, "id")
+		// A message's status goes only with its id: without one, the
+		// backend reads it as an input message, which has no status, and
+		// turns the request away 400 "Unknown parameter: 'input[N].status'"
+		// (Doby on Discord: Pi gives each assistant message it sends again
+		// status "completed"). Codex's own reasoning items carry none.
+		if t := it["type"]; t == nil || t == "message" || t == "reasoning" {
+			delete(it, "status")
+		}
 		switch t, _ := it["type"].(string); t {
 		case "function_call_output", "custom_tool_call_output", "local_shell_call_output":
 			id, _ := it["call_id"].(string)
@@ -418,6 +469,151 @@ func orphanOutput(it map[string]any, id string) map[string]any {
 	}
 	return map[string]any{"type": "message", "role": "assistant",
 		"content": "[Previous " + name + " result; call_id=" + id + "]: " + text}
+}
+
+// The ChatGPT backend turns away a request whose input replays a web search
+// (a web_search_call item) without the web_search tool among its tools: HTTP
+// 200, then only an error event, "response protection is unavailable"
+// (#1270). Codex's turns declare the tool when search is on, but not every
+// request carrying the conversation does: a compaction Codex makes on its
+// own for a custom provider (tools: []), magpie's summary request for a
+// compaction_trigger, a thread's description, a turn with function tools
+// alone. Each failed so on a real account, and each went through once the
+// tool was declared. The tool declared is the cached-only one, which
+// fetches nothing live; a request that offered no tools gets tool_choice
+// "none", so it still calls none.
+
+// cachedSearch is the web_search tool declared for a replayed search.
+func cachedSearch() map[string]any {
+	return map[string]any{"type": "web_search", "external_web_access": false}
+}
+
+// DeclareSearch is body with the web_search tool declared when its input
+// replays a web search and nothing declares the tool, or body as it was.
+// lite says the request goes as Codex's Responses Lite, whose tools are
+// an additional_tools input item: the backend refuses a web_search among
+// a Lite request's tools (400 "only supports function tools, custom tools,
+// and client-executed tool search").
+func DeclareSearch(body []byte, lite bool) []byte {
+	if !bytes.Contains(body, []byte(`"web_search_call"`)) {
+		return body
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var m map[string]any
+	if dec.Decode(&m) != nil || m == nil || !declareSearch(m, lite) {
+		return body
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// declareSearch declares the web_search tool in m, a Responses request,
+// when its input replays a web search and neither its tools nor an
+// additional_tools item declares one, and says whether it did. A request
+// is taken as Lite, too, when it carries an additional_tools item or asks
+// for reasoning context "all_turns", which Lite requires; the backend takes
+// the item on a request that isn't Lite as well.
+func declareSearch(m map[string]any, lite bool) bool {
+	input, ok := m["input"].([]any)
+	if !ok {
+		return false
+	}
+	searched, offered := false, false
+	var additional map[string]any // the first additional_tools item
+	for _, raw := range input {
+		it, _ := raw.(map[string]any)
+		switch it["type"] {
+		case "web_search_call":
+			searched = true
+		case "additional_tools":
+			tools, _ := it["tools"].([]any)
+			if declaresSearch(tools) {
+				return false
+			}
+			offered = offered || len(tools) > 0
+			if additional == nil {
+				additional = it
+			}
+		}
+	}
+	if !searched {
+		return false
+	}
+	var tools []any
+	switch t := m["tools"].(type) {
+	case nil:
+	case []any:
+		tools = t
+	default:
+		return false // not a list: left for the backend to say so
+	}
+	if declaresSearch(tools) {
+		return false
+	}
+	offered = offered || len(tools) > 0
+	reasoning, _ := m["reasoning"].(map[string]any)
+	lite = lite || additional != nil || reasoning["context"] == "all_turns"
+	switch {
+	case additional != nil:
+		have, _ := additional["tools"].([]any)
+		additional["tools"] = append(have, cachedSearch())
+	case lite:
+		m["input"] = append([]any{map[string]any{"type": "additional_tools", "role": "developer",
+			"tools": []any{cachedSearch()}}}, input...)
+	default:
+		m["tools"] = append(tools, cachedSearch())
+	}
+	if !offered {
+		switch c := m["tool_choice"].(type) {
+		case nil:
+			m["tool_choice"] = "none"
+		case string:
+			if c == "" || c == "auto" || c == "none" {
+				m["tool_choice"] = "none"
+			}
+		}
+	}
+	return true
+}
+
+// declaresSearch says whether tools has a web search among them: the
+// hosted one by any of its names (web_search, web_search_preview, a dated
+// one), or Codex's own web.run, a function in the "web" namespace.
+//
+// Codex declares web.run in place of the hosted tool, never beside it: on a
+// model its catalog puts on Responses Lite, or with its standalone web
+// search on, it offers the function and leaves web_search out. The ChatGPT
+// backend refuses a request that carries both ("a single request can't
+// contain both a client-declared function web.run and the hosted tool
+// web_search", Savin on Discord, Codex 0.163.0-alpha), so a conversation
+// that replays an earlier web_search_call under web.run is sent as Codex
+// sent it, with no hosted tool added: web.run is the search the backend
+// serves it, through /alpha/search.
+func declaresSearch(tools []any) bool {
+	for _, raw := range tools {
+		t, _ := raw.(map[string]any)
+		typ, _ := t["type"].(string)
+		name, _ := t["name"].(string)
+		switch {
+		case strings.HasPrefix(typ, "web_search"):
+			return true
+		case typ == "function" && name == "web.run":
+			return true
+		case typ == "namespace" && name == "web":
+			inner, _ := t["tools"].([]any)
+			for _, raw := range inner {
+				f, _ := raw.(map[string]any)
+				if f["type"] == "function" && f["name"] == "run" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func firstLine(s string) string {

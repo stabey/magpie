@@ -2,13 +2,19 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // claudeDistroHome is a distro's / in a temp dir with a user whose
@@ -40,7 +46,7 @@ func noOwnClaude(t *testing.T) {
 // The probe asks after Claude Code as after Codex and Pi, and reads what
 // it says.
 func TestWSLProbeFindsClaude(t *testing.T) {
-	for _, want := range []string{`[ -d "$HOME/.claude" ] && echo dir:.claude`, `command -v claude >/dev/null 2>&1 && echo bin:claude`,
+	for _, want := range []string{`[ -d "$HOME/.claude" ] && echo dir:.claude`, `p=$(command -v claude 2>/dev/null || wslbin claude) && echo "bin:claude $p"`,
 		`[ -d "$HOME/.pi" ] && echo dir:.pi`, `[ -d "$HOME/.codex" ] && echo dir:.codex`} {
 		if !strings.Contains(wslProbeScript, want) {
 			t.Errorf("probe lacks %q:\n%s", want, wslProbeScript)
@@ -57,7 +63,7 @@ func TestWSLProbeFindsClaude(t *testing.T) {
 // effort it starts on; one with Codex, Pi and Claude Code has all three,
 // each read as before and kept apart in wsl.json.
 func TestWSLClaudeDiscovered(t *testing.T) {
-	root, home := claudeDistroHome(t, `{"model": "claude-opus-5-5", "effortLevel": "high"}`)
+	root, home := claudeDistroHome(t, `{"model": "claude-opus-5-5", "modelSettings": {"claude-opus-5-5": {"effortLevel": "high"}}}`)
 	allRoot := t.TempDir()
 	os.MkdirAll(filepath.Join(allRoot, "root", ".codex"), 0o755)
 	os.MkdirAll(filepath.Join(allRoot, "root", ".pi", "agent"), 0o755)
@@ -143,7 +149,7 @@ func TestWSLClaudePick(t *testing.T) {
 			gw = "http://172.20.0.1:" + gateway.Port()
 		}
 		env := func(k string) string { v, _ := edit.GetJSON(path, "env."+k); return v }
-		if env("ANTHROPIC_BASE_URL") != gw || env("ANTHROPIC_AUTH_TOKEN") != gateway.Token || env("ANTHROPIC_MODEL") != "relay/glm-4.6" ||
+		if env("ANTHROPIC_BASE_URL") != gw || env("ANTHROPIC_AUTH_TOKEN") != gateway.Token || env("ANTHROPIC_MODEL") != "" ||
 			env("ANTHROPIC_DEFAULT_HAIKU_MODEL") != "relay/glm-4.6" || env(claudeEffortEnv) != "max" {
 			t.Fatalf("mirrored %v:\n%s", mirrored, readFile(path))
 		}
@@ -159,6 +165,9 @@ func TestWSLClaudePick(t *testing.T) {
 		nat := t.TempDir()
 		os.MkdirAll(filepath.Join(nat, ".claude"), 0o755)
 		os.WriteFile(filepath.Join(nat, ".claude", "settings.json"), []byte(before), 0o644)
+		// syncHome's CLAUDE_CONFIG_DIR names the sandbox's own ~/.claude,
+		// which native Claude Code now reads (#1482): this one's is nat's
+		t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(nat, ".claude"))
 		n := claude(nat)
 		n.Field("model").Set("relay/glm-4.6")
 		n.Field("effort").Set("max")
@@ -244,6 +253,11 @@ func TestWSLClaudeStopped(t *testing.T) {
 	if v := a.Values(); v["model"] != "relay/glm-4.6" || v["effort"] != "low" {
 		t.Fatalf("values %v", v)
 	}
+	// magpie claude@wsl:Stopped opus is its model, as on a running distro,
+	// not its opus tier shown
+	if !slices.Equal(a.ModelAliases, claudeAliases) {
+		t.Fatalf("model aliases %v", a.ModelAliases)
+	}
 	opts := a.Field("model").Options(a.Values())
 	if len(opts) == 0 {
 		t.Fatal("no model options")
@@ -309,6 +323,77 @@ func TestWSLClaudeStandIn(t *testing.T) {
 	os.WriteFile(path, []byte(`{"env":{"ANTHROPIC_MODEL":"a/main"}}`), 0o644)
 	if got := wslClaudeStandIn("claude-haiku-4-5"); got != "" {
 		t.Fatalf("not routed: %q", got)
+	}
+	noOwnClaude(t)
+}
+
+// The models magpie serves on the Claude account this machine's Claude
+// Code is signed in to fold into one row of its picker (#496), the same
+// models a second time. A distro's Claude Code has a sign-in of its own,
+// which magpie doesn't read, so its picker leaves them as they are: it
+// folded them all the same while the distro ran, only a stopped one's
+// options leaving them out.
+func TestWSLClaudeNotFolded(t *testing.T) {
+	root, _ := claudeDistroHome(t, `{"model": "claude-opus-5-5"}`)
+	home, _ := os.UserHomeDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	writeFile(t, catalog.CachePath(), `{"anthropic":{"models":{"claude-opus-5-5":{"id":"claude-opus-5-5","name":"Claude Opus 5.5","limit":{"context":1000000}}}}}`)
+	catalog.Reset()
+	// this machine's Claude Code signed in, as its files say, with an inert
+	// claude first on PATH: the machine's own is never asked
+	bin := t.TempDir()
+	testenv.Program(t, filepath.Join(bin, "claude"), "#!/bin/sh\nexit 1\n")
+	writeFile(t, filepath.Join(bin, "claude.cmd"), "@exit /b 1\r\n")
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	writeFile(t, filepath.Join(home, ".claude", ".credentials.json"), fmt.Sprintf(
+		`{"claudeAiOauth":{"accessToken":"tok","refreshToken":"r","expiresAt":%d,"subscriptionType":"max"}}`, time.Now().Add(time.Hour).UnixMilli()))
+	writeFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"emailAddress":"me@example.com"}}`)
+	provider.ForgetAccounts()
+	t.Cleanup(provider.ForgetAccounts)
+
+	folded := func(a *Agent) (n int) {
+		for _, o := range a.Field("model").Options(a.Values()) {
+			if o.Same {
+				n++
+			}
+		}
+		return n
+	}
+	if n := folded(claude(home)); n != 1 {
+		t.Fatalf("this machine's Claude Code: %d folded, want claude/claude-opus-5-5[1m]", n)
+	}
+	for _, running := range []bool{true, false} {
+		d := distro{Name: "Debian", Root: root, Home: "/home/me", Has: map[string]bool{"dir:.claude": true}, Mirrored: true, Running: running}
+		if n := folded(wslAgent(wslKindOf("claude"), d)); n != 0 {
+			t.Errorf("Claude Code in WSL Debian, running %v: %d folded", running, n)
+		}
+	}
+}
+
+// A WSL agent is found by its id however it is spelt — the distro's own
+// case, lower, upper — and by a prefix of it: an id in lowercase comes up
+// wherever a typed name is lowercased before it is looked for.
+func TestWSLAgentIDFound(t *testing.T) {
+	// wslAgents() is Windows-only and the suite runs on macOS and Linux:
+	// turned on, the fake distro's agent is in All() and Find here too
+	on := wslOn
+	wslOn = true
+	t.Cleanup(func() { wslOn = on })
+	root, _ := claudeDistroHome(t, `{"model": "claude-opus-5-5"}`)
+	fakeWSL(t, "Debian\r\n", "Debian\r\n", map[string]string{
+		"Debian": "home:/home/me\ndir:.claude\n",
+	}, map[string]string{"Debian": root})
+	if ds := wslDistros(); len(ds) != 1 || ds[0].Name != "Debian" {
+		t.Fatalf("%+v", ds)
+	}
+	for _, q := range []string{"claude@wsl:Debian", "claude@wsl:debian", "CLAUDE@WSL:DEBIAN", "claude@wsl"} {
+		a, err := Find(q)
+		if err != nil || a.ID != "claude@wsl:Debian" {
+			t.Errorf("%q: %v, %+v", q, err, a)
+		}
+	}
+	if _, err := Find("codex@wsl:Debian"); err == nil {
+		t.Error("codex@wsl:Debian found though the distro has none")
 	}
 	noOwnClaude(t)
 }

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 const tokyoColors = `mode = "dark"
@@ -124,6 +125,11 @@ func TestCurrent(t *testing.T) {
 	if !Detect() {
 		t.Fatal("not detected")
 	}
+	// start from nothing read: a theme a run before read (-count=2) would
+	// otherwise be handed back within its second, its font with it
+	mu.Lock()
+	cached, seen, asked, desk, font = Theme{}, "", time.Time{}, "", ""
+	mu.Unlock()
 	th, ok := Current()
 	if !ok || th.Name != "tokyo-night" || th.Vars["--bg"] != "#1a1b26" || th.Stamp == "" {
 		t.Fatalf("%v %+v", ok, th)
@@ -137,6 +143,29 @@ func TestCurrent(t *testing.T) {
 	th2, _ := Current()
 	if th2.Stamp == th.Stamp || th2.Mode != "light" || th2.Vars["--bg"] != "#fafafa" {
 		t.Fatalf("not read again: %+v", th2)
+	}
+	// a theme set asks neither omarchy-font-current nor hyprctl (Hyprland
+	// reloads meanwhile and hyprctl stalls): the font stays as it was asked
+	if th2.Vars["--font"] != th.Vars["--font"] || th.Vars["--font"] == "" {
+		t.Fatalf("font %q then %q", th.Vars["--font"], th2.Vars["--font"])
+	}
+	t.Setenv("MAGPIE_OMARCHY_FONT", "JetBrains Mono")
+	os.WriteFile(filepath.Join(dir, "colors.toml"), []byte(tokyoColors), 0o644)
+	mu.Lock()
+	asked = asked.Add(-2e9)
+	mu.Unlock()
+	if th3, _ := Current(); th3.Vars["--bg"] != "#1a1b26" || th3.Vars["--font"] != th.Vars["--font"] {
+		t.Fatalf("the theme set asked for the font again: %q", th3.Vars["--font"])
+	}
+	// omarchy-font-set (fontconfig's file) does
+	cfg := os.Getenv("XDG_CONFIG_HOME")
+	os.MkdirAll(filepath.Join(cfg, "fontconfig"), 0o755)
+	os.WriteFile(filepath.Join(cfg, "fontconfig", "fonts.conf"), []byte("<fontconfig/>"), 0o644)
+	mu.Lock()
+	asked = asked.Add(-2e9)
+	mu.Unlock()
+	if th4, _ := Current(); th4.Vars["--font"] == th.Vars["--font"] {
+		t.Fatalf("a new font not asked: %q", th4.Vars["--font"])
 	}
 	t.Setenv("MAGPIE_OMARCHY", "0")
 	if Detect() {

@@ -10,8 +10,12 @@ import (
 )
 
 // Tests don't ask vendors how much of an allowance is used: the gateway
-// would, behind a request, of whatever upstream a test serves.
-func init() { allowances = func(string) map[string]provider.Allowance { return nil } }
+// would, behind a request, of whatever upstream a test serves — nor how
+// much of a key's own windows.
+func init() {
+	allowances = func(string) map[string]provider.Allowance { return nil }
+	keyAllowance = func(provider.Provider) (provider.Allowance, bool) { return nil, false }
+}
 
 func restsOf(cs []candidate) string {
 	s := ""
@@ -22,6 +26,7 @@ func restsOf(cs []candidate) string {
 }
 
 func TestRouting(t *testing.T) {
+	forgetRouting()
 	cs := []candidate{{rest: "r#a"}, {rest: "r#b"}, {rest: "r#c"}}
 	p := provider.Provider{ID: "r"}
 	if got := restsOf(route(p, cs, "m", provider.Chat)); got != "r#a r#b r#c " {
@@ -94,6 +99,7 @@ func TestRoutingKeepsModelAllowancesSeparate(t *testing.T) {
 // Smart routing keeps the first while it has quota to spare, then goes to
 // whichever has the most; a failure rests as long as it says.
 func TestSmartRouting(t *testing.T) {
+	forgetRouting()
 	old := allowances
 	defer func() { allowances = old }()
 	one := func(used float64, resets time.Time) provider.Allowance {
@@ -185,6 +191,14 @@ func TestSmartRouting(t *testing.T) {
 		{429, "You've hit your limit · resets 5pm (Asia/Shanghai)", failQuota},
 		{502, "Claude AI usage limit reached|1790000000", failQuota},
 		{503, `overloaded`, failOther},
+		// a 5xx is the server's, whatever its words, unless the vendor's
+		// quota code says otherwise (#1418)
+		{500, `当前模型 gpt-5.5 负载已经达到上限，请稍后重试 (request id: 20261011161901234567890abcdefgh)`, failOther},
+		{503, `{"error":{"message":"upstream quota service unavailable"}}`, failOther},
+		{500, `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":3600}}`, failQuota},
+		{503, `{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}`, failQuota},
+		{403, `今日额度已达上限`, failQuota},
+		{429, `{"error":{"message":"当前分组上游负载已饱和，请稍后再试"}}`, failRate},
 	} {
 		if got := failure(c.status, []byte(c.body)); got != c.want {
 			t.Errorf("%d %s: %s, want %s", c.status, c.body, got, c.want)
@@ -260,5 +274,43 @@ func TestUnknownClaudeGoesFirst(t *testing.T) {
 	}
 	if w := weighed(got[2], p, wg, false, provider.Anthropic); w.Learns {
 		t.Fatalf("other agent: %+v", w)
+	}
+}
+
+// Smart with an account that has the five hours alone (Claude
+// Enterprise): they renew soonest, so it goes first, ahead of weeks — but
+// behind a week renewing sooner still — and so does it with its five
+// hours not started, which renew within five hours of now (#576), not
+// after every week as a reset not known.
+func TestSmartFiveHoursAlone(t *testing.T) {
+	old := allowances
+	defer func() { allowances = old }()
+	now := time.Now().Truncate(time.Hour).Add(20 * time.Minute)
+	five, week := 5*time.Hour, 7*24*time.Hour
+	weekly := func(in time.Duration) provider.Allowance {
+		return provider.Allowance{
+			{Used: 10, Resets: now.Add(time.Hour), Span: five},
+			{Used: 30, Resets: now.Add(in), Span: week},
+		}
+	}
+	share := map[string]provider.Allowance{
+		"w": weekly(2 * 24 * time.Hour),
+		"e": {{Used: 0, Span: five}}, // not started
+	}
+	allowances = func(string) map[string]provider.Allowance { return share }
+	acct := func(user string) candidate {
+		return candidate{p: provider.Provider{Account: &provider.Account{Agent: "x", User: user}}, model: "m", rest: "s#" + user}
+	}
+	p := provider.Provider{ID: "s", Account: &provider.Account{Agent: "x"}}
+	if got := restsOf(route(p, []candidate{acct("w"), acct("e")}, "m", provider.Chat)); got != "s#e s#w " {
+		t.Fatalf("five hours not started, ahead of a week in two days: %s", got)
+	}
+	share["e"] = provider.Allowance{{Used: 40, Resets: now.Add(3 * time.Hour), Span: five}}
+	if got := restsOf(route(p, []candidate{acct("w"), acct("e")}, "m", provider.Chat)); got != "s#e s#w " {
+		t.Fatalf("five hours started, ahead of a week in two days: %s", got)
+	}
+	share["w"] = weekly(time.Hour)
+	if got := restsOf(route(p, []candidate{acct("e"), acct("w")}, "m", provider.Chat)); got != "s#w s#e " {
+		t.Fatalf("a week renewing within the hour first: %s", got)
 	}
 }

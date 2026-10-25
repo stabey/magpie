@@ -88,7 +88,9 @@ func TestCodexSwitchedWhenUsedUp(t *testing.T) {
 
 // Claude Code signed in to an account Smart counts spent (98%) is signed
 // in to the next account that is on and has room — its credentials and
-// .claude.json's account both — and not before (#208, #209).
+// .claude.json's account both — and not before (#208, #209). What it
+// goes by is what Claude Code told as it answered: Anthropic's usage
+// endpoint isn't read for it.
 func TestClaudeSwitchedWhenSpent(t *testing.T) {
 	home := claudeHome(t)
 	cred := claudeSignIn(t, home, time.Now().Add(time.Hour)) // sk-ant-oat01-old
@@ -105,10 +107,9 @@ func TestClaudeSwitchedWhenSpent(t *testing.T) {
 	}
 	loginsMu.Unlock()
 
-	used := map[string]float64{"Bearer sk-ant-oat01-old": 97, "Bearer sk-ant-oat01-b": 10}
+	used := map[string]float64{"a@example.com": 97, "b@example.com": 10}
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"five_hour": map[string]any{"utilization": used[r.Header.Get("Authorization")],
-			"resets_at": time.Now().Add(time.Hour).Format(time.RFC3339)}})
+		t.Errorf("usage endpoint read: %s", r.URL)
 	}))
 	defer fake.Close()
 	claudeBase = fake.URL // isolate puts it back
@@ -120,6 +121,9 @@ func TestClaudeSwitchedWhenSpent(t *testing.T) {
 		claudeUsage.Lock()
 		claudeUsage.m = nil
 		claudeUsage.Unlock()
+		for user, u := range used {
+			NoteClaudeLimits(user, []ClaudeLimit{{Kind: "five_hour", Used: u / 100, ResetsAt: time.Now().Add(time.Hour).Unix()}})
+		}
 		to, err := SwitchWhenSpent(context.Background(), "claude")
 		if err != nil {
 			t.Fatal(err)
@@ -131,7 +135,7 @@ func TestClaudeSwitchedWhenSpent(t *testing.T) {
 	if to := switched(); to != "" {
 		t.Fatalf("switched to %s at 97%%", to)
 	}
-	used["Bearer sk-ant-oat01-old"] = 98
+	used["a@example.com"] = 98
 	if to := switched(); to != "b@example.com" {
 		t.Fatalf("switched to %q at 98%%", to)
 	}
@@ -153,7 +157,7 @@ func TestClaudeSwitchedWhenSpent(t *testing.T) {
 	if to := switched(); to != "" {
 		t.Fatalf("switched again, to %s", to)
 	}
-	used["Bearer sk-ant-oat01-b"] = 99
+	used["b@example.com"] = 99
 	if to := switched(); to != "" {
 		t.Fatalf("switched to %s, spent as well", to)
 	}
@@ -166,4 +170,69 @@ func mustJSONRaw(t *testing.T, v any) json.RawMessage {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// An account the Codex app holds is spent whatever its windows read: a
+// Business seat at its workspace owner's limit reads 40% and isn't
+// allowed, and the app says "You're out of Codex usage" and sends nothing
+// for it. Codex on it is signed in to the next account with room, and
+// never to another the app holds (CavillZhang on X: "有的切换不了").
+func TestCodexHeldAccountSwitchedUnderTheShare(t *testing.T) {
+	home := signIn(t) // me@example.com, acct-1
+	rememberLogins(true)
+	codexSignIn(t, home, "spare@example.com", "r-spare")
+	rememberLogins(true)
+	codexSignIn(t, home, "work@example.com", "r-work")
+	rememberLogins(true)
+	held := map[string]bool{"acct-1": true, "acct-spare@example.com": true, "acct-work@example.com": true}
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		allowed := !held[r.Header.Get("chatgpt-account-id")]
+		why := map[string]any{"type": "workspace_owner_usage_limit_reached"}
+		if allowed {
+			why = nil
+		}
+		json.NewEncoder(w).Encode(map[string]any{"plan_type": "business",
+			"credits":                 map[string]any{"has_credits": false, "unlimited": false, "overage_limit_reached": false},
+			"rate_limit_reached_type": why,
+			"rate_limit": map[string]any{"allowed": allowed, "limit_reached": !allowed,
+				"primary_window": map[string]any{"used_percent": 40, "limit_window_seconds": 18000}}})
+	}))
+	defer fake.Close()
+	old := CodexBase
+	CodexBase = fake.URL + "/backend-api/codex"
+	t.Cleanup(func() { CodexBase = old })
+	switched := func() string {
+		t.Helper()
+		loginUsageCache.Lock()
+		loginUsageCache.m = nil
+		loginUsageCache.Unlock()
+		to, err := SwitchWhenSpent(context.Background(), "codex")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return to
+	}
+	for _, u := range []string{"spare@example.com", "work@example.com"} {
+		if err := SetLoginOn("codex", u, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Codex is on work@; every other account held too: nothing to go to
+	if to := switched(); to != "" {
+		t.Fatalf("switched to %s, held as well", to)
+	}
+	// one with room: that one, though the held one it is on reads 40%
+	held["acct-spare@example.com"] = false
+	if to := switched(); to != "spare@example.com" {
+		t.Fatalf("switched to %q, want spare@example.com", to)
+	}
+	// and not back to the one it left while the app still holds it
+	if to := switched(); to != "" {
+		t.Fatalf("switched again, to %s", to)
+	}
+	// once that has room again, back to it
+	held["acct-work@example.com"] = false
+	if to := switched(); to != "work@example.com" {
+		t.Fatalf("switched to %q, want back to work@example.com", to)
+	}
 }

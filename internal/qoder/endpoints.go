@@ -1,56 +1,81 @@
-// Package qoder speaks Qoder's inference API (api3.qoder.sh
-// agent_chat_generation SSE) the way the Qoder desktop client does, so a
-// Qoder subscription can serve every agent through magpie's gateway. The
-// protocol (endpoints, the COSY request envelope, the body codec and the
-// device-flow sign-in) is ported from CLIProxyAPI's qoder support, which
-// reverse-engineered it from the client and verified it against live captures.
+// Package qoder holds what the move of Qoder's and Qoder CN's built-in
+// accounts onto their plugin reads: the sites' ids and names and the
+// credential kept in each account's auth blob. The credential's shape is
+// ported from CLIProxyAPI's qoder support.
 // Source: https://github.com/ufec/CLIProxyAPI (MIT); see LICENSE in this directory.
 // Copyright (c) 2025-2005.9 Luis Pater
 // Copyright (c) 2025.9-present Router-For.ME
-//
-// This package supports the global Qoder client.
 package qoder
 
-// OAuth device-flow configuration (verified against live captures).
-const (
-	// ClientID is Qoder's device-flow client id.
-	ClientID = "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa"
+// PLUGIN-SERVED (see AGENTS.md): Qoder ("qoder") and Qoder CN ("qoder-cn")
+// are retired built-in subscriptions served by their plugin,
+// @magpie-community/opencode-qoder-auth, moved or not. Their built-in
+// sign-in, models, requests and usage are gone; only the move, in
+// internal/provider/migrate_qoder.go, still reads their accounts. A fix
+// belongs in the plugin (github.com/magpie-community/plugins,
+// packages/qoder), with the movers' min raised in migrate_qoder.go.
 
-	// DeviceFlowHost is the device-flow authorization page host.
-	DeviceFlowHost = "https://qoder.com"
-
-	// OpenAPIHost is the API host for token polling and job-token exchange.
-	OpenAPIHost = "https://openapi.qoder.sh"
-
-	// APIHost is the model inference API host.
-	APIHost = "https://api3.qoder.sh"
-
-	// RedirectURI is Qoder's app scheme used by the device flow.
-	RedirectURI = "qoder-app://"
-)
-
-// API endpoints.
-const (
-	DeviceSelectAccountsPath = "/device/selectAccounts"
-	DeviceTokenPollPath      = "/api/v1/deviceToken/poll"
-	DeviceTokenRefreshPath   = "/api/v1/deviceToken/refresh"
-	JobTokenPath             = "/api/v1/me/jobToken"
-	JobTokenRefreshPath      = "/api/v1/jobToken/refresh"
-
-	// ChatPath is the SSE chat endpoint. The query asks for the LLM result
-	// to be fetched, names the common agent, and says Encode=1 to use the
-	// custom base64 body codec.
-	ChatPath = "/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
-
-	// ListModelsPath is the live model listing endpoint.
-	ListModelsPath = "/algo/api/v2/model/list?Encode=1"
-
-	// AccountUsagePath is the desktop client's account usage endpoint.
-	AccountUsagePath = "/sash/api/v2/me/usage"
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 )
 
 // ProviderKey is how magpie names this subscription.
 const ProviderKey = "qoder"
 
-// ChatURL is the full chat endpoint on the inference host.
-func ChatURL() string { return APIHost + ChatPath }
+// CNProviderKey is how magpie names the Qoder CN subscription; it is also the
+// id of Qoder CN's CLI agent.
+const CNProviderKey = "qoder-cn"
+
+// Site is one Qoder deployment.
+type Site struct {
+	ID   string // the provider id magpie keeps its accounts under
+	Name string
+}
+
+// Global is qoder.com.
+var Global = &Site{ID: ProviderKey, Name: "Qoder"}
+
+// CN is qoder.cn.
+var CN = &Site{ID: CNProviderKey, Name: "Qoder CN"}
+
+// SiteOf is the site a provider id or a credential's Site names; anything but
+// Qoder CN, including none, is the global site.
+func SiteOf(id string) *Site {
+	if id == CNProviderKey {
+		return CN
+	}
+	return Global
+}
+
+// Credential is kept in the account's auth blob in magpie's logins.json.
+type Credential struct {
+	UID           string          `json:"uid"`
+	Email         string          `json:"email,omitempty"`
+	Name          string          `json:"name,omitempty"`
+	Token         string          `json:"token"`
+	RefreshToken  string          `json:"refresh_token"`
+	DeviceToken   string          `json:"device_token"`
+	DeviceRefresh string          `json:"device_refresh,omitempty"`
+	ExpiresAt     int64           `json:"expires_at"`
+	MachineID     string          `json:"machine_id"`
+	Models        json.RawMessage `json:"models,omitempty"`
+	// Site is the Qoder site the account is on: CNProviderKey for Qoder CN,
+	// empty for the global site (every credential saved before there were two).
+	Site string `json:"site,omitempty"`
+	// DeviceChat says Token is the device token itself, as Qoder CN's CLI
+	// uses it.
+	DeviceChat bool `json:"device_chat,omitempty"`
+}
+
+// NewMachineID generates the stable identity kept with one account: a
+// random v4 UUID in the dashed 8-4-4-4-12 form.
+func NewMachineID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = b[6]&0x0f | 0x40 // version 4
+	b[8] = b[8]&0x3f | 0x80 // variant 10
+	h := hex.EncodeToString(b[:])
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}

@@ -2,13 +2,17 @@ package profile
 
 import (
 	"encoding/json"
+	"github.com/yetone/magpie/internal/testenv"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/agent"
+	"github.com/yetone/magpie/internal/agentenv"
 	"github.com/yetone/magpie/internal/library"
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // sandbox is a home with Claude Code and Codex in it and nothing on PATH.
@@ -18,10 +22,19 @@ func sandbox(t *testing.T) string {
 	t.Setenv("HOME", h)
 	t.Setenv("USERPROFILE", h)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
-	t.Setenv("PATH", "")
-	for _, k := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "COPILOT_HOME", "APPDATA"} {
+	// Claude Code's and Codex's CLIs are here: an agent whose CLI is gone
+	// is no Library target (#2254), and these tests carry its library
+	bin := filepath.Join(h, "bin")
+	for _, cli := range []string{"claude", "codex"} {
+		testenv.Program(t, filepath.Join(bin, cli), "#!/bin/sh\n")
+		write(t, filepath.Join(bin, cli+".exe"), "")
+	}
+	t.Setenv("PATH", bin)
+	for _, k := range agentenv.Vars {
 		t.Setenv(k, "")
 	}
+	t.Setenv("APPDATA", "")
+	t.Setenv("LOCALAPPDATA", "")
 	for _, f := range []string{".claude/settings.json", ".codex/config.toml"} {
 		write(t, filepath.Join(h, f), "")
 	}
@@ -155,5 +168,39 @@ func TestProfileCarriesLibrary(t *testing.T) {
 	}
 	if !strings.Contains(read(t, filepath.Join(h, ".codex/config.toml")), "mcp_servers.fs") {
 		t.Error("codex has no fs after b")
+	}
+}
+
+// A profile can name agents this computer doesn't have: profiles sync
+// between computers. Applying one leaves those agents alone, so it never
+// writes a config that makes an agent look installed here (qtwaiter on X).
+func TestApplySkipsUndetectedAgents(t *testing.T) {
+	sandbox(t)
+	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Chat: "https://relay.example.com/v1",
+		Key: "synthetic-key", Models: []string{"pro"}}); err != nil {
+		t.Fatal(err)
+	}
+	p := Profile{Fields: map[string]string{"claude.model": "relay/pro"}}
+	for _, a := range agent.All() {
+		if a.Detected() || a.Field("model") == nil {
+			continue
+		}
+		p.Fields[a.ID+".model"] = "relay/pro"
+	}
+	if len(p.Fields) < 2 {
+		t.Fatal("no undetected agent with a model field")
+	}
+	_, err := Apply(p)
+	if got := must[*agent.Agent](t)(agent.Find("claude")).Field("model").Get(); got != "relay/pro" {
+		t.Errorf("claude's model is %q", got)
+	}
+	for k := range p.Fields {
+		a := must[*agent.Agent](t)(agent.Find(strings.TrimSuffix(k, ".model")))
+		if a.ID != "claude" && a.Detected() {
+			t.Errorf("applying the profile made %s look installed", a.ID)
+		}
+	}
+	if err != nil {
+		t.Error(err)
 	}
 }

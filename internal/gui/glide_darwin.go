@@ -96,22 +96,54 @@ static int tintPanel(void *w, int r, int g, int b, int a, int ms) {
 	return ok;
 }
 
-// A Dock icon is the Regular activation policy, none is Accessory. Leaving
-// the Dock deactivates the app, so with front set it is brought back to the
-// front after, with the window the Settings page is in; a window just closed
-// leaves it where it is.
-static void setDock(int on, int front) {
+// A Dock icon is the Regular activation policy, none is Accessory.
+static int appRegular(void) { return [NSApp activationPolicy] == NSApplicationActivationPolicyRegular; }
+static void setRegular(int on) {
+	[NSApp setActivationPolicy:on ? NSApplicationActivationPolicyRegular : NSApplicationActivationPolicyAccessory];
+}
+static void activate(void) { [NSApp activateIgnoringOtherApps:YES]; }
+
+// An app activated while out of the Dock that then joins it stays last in
+// Command-Tab's order, behind every other app, though it is in front: one
+// Command-Tab away can't come back to it (#1381). Activating it again does
+// nothing while it is active. Activating the Dock, which has no windows or
+// menu bar of its own, and then magpie at once puts magpie first.
+static void activateAgain(void) {
+	NSRunningApplication *dock = [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.dock"].firstObject;
+	if (dock != nil) [dock activateWithOptions:0];
+	[NSApp activateIgnoringOtherApps:YES];
+}
+
+// A full-screen window's title bar, buttons and all, comes down from the top
+// of the screen only with the menu bar, and an app out of the Dock has none.
+// It joins the Dock as the window starts going full screen: once the window
+// is full screen, joining brings neither back. Wails' window events reach Go
+// later than that, so this is the notification's own observer. Joining
+// while active, as it is then, leaves it last in Command-Tab's order; once
+// the window is full screen it is activated again (activateAgain).
+static void dockOnFullscreen(void) {
 	dispatch_async(dispatch_get_main_queue(), ^{
-		NSApplicationActivationPolicy p = on ? NSApplicationActivationPolicyRegular : NSApplicationActivationPolicyAccessory;
-		if ([NSApp activationPolicy] == p) return;
-		[NSApp setActivationPolicy:p];
-		if (front) [NSApp activateIgnoringOtherApps:YES];
+		__block BOOL again = NO;
+		[[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillEnterFullScreenNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+			if ([NSApp activationPolicy] == NSApplicationActivationPolicyRegular) return;
+			again = [NSApp isActive];
+			[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+		}];
+		[[NSNotificationCenter defaultCenter] addObserverForName:NSWindowDidEnterFullScreenNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+			if (!again) return;
+			again = NO;
+			activateAgain();
+		}];
 	});
 }
 */
 import "C"
 
-import "github.com/wailsapp/wails/v3/pkg/application"
+import (
+	"unsafe"
+
+	"github.com/wailsapp/wails/v3/pkg/application"
+)
 
 // glidePanel moves the shown panel to height, its top edge held under the
 // menu bar. It says false when it can't, for the caller to size it plainly.
@@ -127,7 +159,16 @@ func (h *host) glidePanel(height int, g Glide) bool {
 
 // TintPanel paints the panel's tint under the page, fading to it over ms.
 func (h *host) TintPanel(c [4]uint8, ms int) bool {
-	w := h.panel.NativeWindow()
+	// tintPanel waits for the main thread, so it can't run on it; winMu
+	// keeps lightweight mode from letting the panel go meanwhile
+	h.winMu.Lock()
+	defer h.winMu.Unlock()
+	w := application.InvokeSyncWithResult(func() unsafe.Pointer {
+		if h.panel == nil {
+			return nil
+		}
+		return h.panel.NativeWindow()
+	})
 	if w == nil {
 		return false
 	}
@@ -142,8 +183,28 @@ func dockPolicy(on bool) application.ActivationPolicy {
 }
 
 // setDock shows magpie in the Dock or takes it out, at once, bringing it to
-// the front after when front.
-func setDock(on, front bool) { C.setDock(C.int(boolInt(on)), C.int(boolInt(front))) }
+// the front after when front (dockStep); on the main thread or off it. On
+// it, it is done before what the caller shows next, so a window shown after
+// is shown by an app already in the Dock.
+func setDock(on, front bool) {
+	application.InvokeSync(func() {
+		m := dockStep(C.appRegular() != 0, on, front)
+		if !m.policy {
+			return
+		}
+		C.setRegular(C.int(boolInt(on)))
+		switch {
+		case m.again:
+			C.activateAgain()
+		case m.front:
+			C.activate()
+		}
+	})
+}
+
+// dockOnFullscreen puts magpie in the Dock whenever a window goes full
+// screen; leaving it, the window puts magpie back as the settings say.
+func dockOnFullscreen() { C.dockOnFullscreen() }
 
 func boolInt(b bool) int {
 	if b {
@@ -151,6 +212,10 @@ func boolInt(b bool) int {
 	}
 	return 0
 }
+
+// zoomsAfterLoad: the Mac's text size is put on a page by applyZoom and
+// madeAgain.
+const zoomsAfterLoad = false
 
 // setPageZoom zooms w's page to z, the text size.
 func setPageZoom(w *application.WebviewWindow, z float64) {

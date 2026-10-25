@@ -39,6 +39,14 @@ func splitAntigravityID(id string) (family, effort string) {
 	return id, ""
 }
 
+// EffortFamily is the model an id with an effort word after it is a level
+// of ("gemini-3.8-flash-medium" is gemini-3.8-flash), and the id itself
+// when it has none.
+func EffortFamily(id string) string {
+	f, _ := splitAntigravityID(id)
+	return f
+}
+
 // antigravityNameEffort is the level a name's last words in brackets say
 // ("Gemini 3.7 Flash (High)" is high), and the name without them.
 func antigravityNameEffort(name string) (string, string) {
@@ -62,6 +70,24 @@ func antigravityNameEffort(name string) (string, string) {
 		return name, ""
 	}
 	return strings.TrimSpace(name[:open]), level
+}
+
+// antigravityNameSpells is whether a name, without the level in brackets,
+// is the id's family written out: "Gemini 3.5 Flash Lite" spells
+// gemini-3.5-flash-lite, "Gemini 3.7 Flash (Low)" gemini-3.7-flash-low;
+// "Gemini 3.5 Flash Lite" doesn't spell gemini-2.5-flash.
+func antigravityNameSpells(name, id string) bool {
+	n, _ := antigravityNameEffort(name)
+	n = strings.Join(strings.Fields(n), "-")
+	return n != "" && strings.EqualFold(n, EffortFamily(id))
+}
+
+// antigravityEnumNames is whether Antigravity's enum for a model names that
+// id itself (MODEL_GOOGLE_GEMINI_2_5_FLASH is gemini-2.5-flash); the
+// models it names for themselves have placeholders (MODEL_PLACEHOLDER_M198).
+func antigravityEnumNames(enum, id string) bool {
+	e, ok := strings.CutPrefix(enum, "MODEL_GOOGLE_")
+	return ok && e != "" && strings.EqualFold(e, strings.NewReplacer("-", "_", ".", "_").Replace(id))
 }
 
 // antigravityFamily is one family of Antigravity's ids.
@@ -160,7 +186,15 @@ func antigravityFamilies(raw []catalog.Model) []*antigravityFamily {
 }
 
 // collapseAntigravityModels is Antigravity's list with each family one
-// model; a family of one keeps Antigravity's id and name.
+// model; a family of one keeps Antigravity's id and name. Antigravity
+// names no -tiered id (gemini-3.7-flash-tiered: one id that thinks at the
+// level the request asks), so an agent's list showed it as its bare id,
+// magpie/antigravity/gemini-3.7-flash-tiered (EZN7L2C3, #955): it is
+// named for the model it is a tier of, "Gemini 3.7 Flash (Tiered)", and
+// any other model Antigravity leaves unnamed by its id. It thinks at the
+// levels that model has, and says so: with none, Pi, Codex and the rest
+// offered no effort for it (PapainTea on X), while sent low, medium or
+// high it thinks ~650, ~3800 or ~10000 tokens on one question.
 func collapseAntigravityModels(raw []catalog.Model) []catalog.Model {
 	var out []catalog.Model
 	for _, f := range antigravityFamilies(raw) {
@@ -169,6 +203,24 @@ func collapseAntigravityModels(raw []catalog.Model) []catalog.Model {
 			continue
 		}
 		out = append(out, f.model())
+	}
+	byID := map[string]catalog.Model{}
+	for _, m := range out {
+		byID[m.ID] = m
+	}
+	for i, m := range out {
+		b, tiered := strings.CutSuffix(m.ID, "-tiered")
+		base, ok := byID[b]
+		if tiered && ok && len(m.Efforts) == 0 {
+			out[i].Efforts = slices.Clone(base.Efforts)
+		}
+		if m.Name != "" {
+			continue
+		}
+		out[i].Name = m.ID
+		if tiered && ok && base.Name != "" && base.Name != b {
+			out[i].Name = base.Name + " (Tiered)"
+		}
 	}
 	return out
 }

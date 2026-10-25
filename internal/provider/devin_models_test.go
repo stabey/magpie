@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
 )
@@ -119,6 +120,7 @@ func TestDevinVariantIn(t *testing.T) {
 func TestDevinEfforts(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	devinFamiliesCached(devinListed)
@@ -202,4 +204,12 @@ func TestDevinTiers(t *testing.T) {
 	if got := devinOffered(DevinOffered(withOwn)); !strings.HasPrefix(got, "Adaptive| claude-opus-5-5|") {
 		t.Errorf("offered to the agent: %s", got)
 	}
+}
+
+// devinFamiliesCached stands in for a model list read from the CLI.
+func devinFamiliesCached(families []DevinFamily) {
+	devinFamiliesCache.Lock()
+	devinFamiliesCache.families, devinFamiliesCache.at = families, time.Now()
+	devinFamiliesCache.failed, devinFamiliesCache.err = time.Time{}, nil
+	devinFamiliesCache.Unlock()
 }

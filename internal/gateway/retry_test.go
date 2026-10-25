@@ -20,6 +20,8 @@ type scripted struct {
 	replies []reply
 	n       int
 	hang    chan struct{} // when set, the first request waits on it
+	hanging chan struct{} // when set, closed as the first request begins to wait on hang
+	limited http.Header   // headers each 429 goes with
 }
 
 type reply struct {
@@ -33,6 +35,9 @@ func (s *scripted) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	i := min(s.n, len(s.replies)-1)
 	s.n++
 	if s.hang != nil && i == 0 {
+		if s.hanging != nil {
+			close(s.hanging)
+		}
 		<-s.hang
 	}
 	x := s.replies[i]
@@ -40,6 +45,11 @@ func (s *scripted) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		x.ctype = "application/json"
 	}
 	w.Header().Set("Content-Type", x.ctype)
+	if x.code == http.StatusTooManyRequests {
+		for k, vs := range s.limited {
+			w.Header()[k] = vs
+		}
+	}
 	if x.code != 0 {
 		w.WriteHeader(x.code)
 	}
@@ -199,21 +209,77 @@ func TestLastOneLeftIsTriedAgain(t *testing.T) {
 	}
 }
 
+// A rate limit on the last one left is waited out, a moment, whether the
+// vendor says how long or not (#503: a relay's 429 with no Retry-After went
+// straight to the agent); one that won't clear in seconds — a plan used up,
+// no money left, a Retry-After an hour away — is the agent's at once.
+func TestRateLimitIsWaitedOut(t *testing.T) {
+	limited := `{"error":{"message":"Rate limit exceeded, please try again later"}}`
+	for _, x := range []struct {
+		name    string
+		said    string
+		header  http.Header
+		times   int // how many times it is limited first
+		code, n int
+	}{
+		{"retry-after", limited, http.Header{"Retry-After": {"1"}}, 1, 200, 2},
+		{"no retry-after", limited, nil, 1, 200, 2},
+		{"relay's own words", `{"error":{"message":"当前分组上游负载已饱和，请稍后再试"}}`, nil, 2, 200, 3},
+		{"thrice", limited, nil, 3, 200, 4},
+		{"too long", limited, nil, 9, 429, 1 + rateRetries},
+		{"usage limit", `{"error":{"message":"You've hit your usage limit. Your limit resets in 5 hours."}}`, nil, 9, 429, 1},
+		{"no balance", `{"error":{"message":"余额不足"}}`, nil, 9, 429, 1},
+		{"an hour away", limited, http.Header{"Retry-After": {"3600"}}, 9, 429, 1},
+	} {
+		fresh(t)
+		a := &scripted{limited: x.header}
+		for range x.times {
+			a.replies = append(a.replies, reply{429, "", x.said})
+		}
+		a.replies = append(a.replies, reply{200, "", chatOK})
+		scriptedOn(t, "a", provider.Chat, a)
+		start := time.Now()
+		code, body := postAs(t, New(), "", `{"model":"a/m","messages":[{"role":"user","content":"hi"}]}`)
+		if code != x.code || a.n != x.n {
+			t.Errorf("%s: %d after %d tries: %s", x.name, code, a.n, body)
+		}
+		if x.n == 1 && time.Since(start) > time.Second {
+			t.Errorf("%s: passed on after %v", x.name, time.Since(start))
+		}
+	}
+}
+
 // An agent that goes away mid-request isn't a provider failing: nobody
 // rests for it and nobody else is asked.
 func TestCanceledRequestRestsNobody(t *testing.T) {
 	fresh(t)
-	a := &scripted{replies: []reply{{200, "", chatOK}}, hang: make(chan struct{})}
+	a := &scripted{replies: []reply{{200, "", chatOK}}, hang: make(chan struct{}), hanging: make(chan struct{})}
 	b := &scripted{replies: []reply{{200, "", chatOK}}}
 	scriptedOn(t, "a", provider.Chat, a)
 	scriptedOn(t, "b", provider.Chat, b)
 	provider.SaveGroup(provider.Group{Name: "G", Members: []string{"a/m", "b/m"}, Routing: provider.Ordered})
 	s := New()
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() { time.Sleep(50 * time.Millisecond); cancel(); time.Sleep(50 * time.Millisecond); close(a.hang) }()
+	served := make(chan struct{})
+	// the agent goes away while a is asked (not a moment after the request
+	// began: on a busy machine a may not be asked yet, #2175), and a never
+	// answers until the gateway is done with the request
+	go func() {
+		select {
+		case <-a.hanging:
+			cancel()
+		case <-served:
+		}
+		select {
+		case <-served:
+		case <-time.After(10 * time.Second):
+		}
+		close(a.hang)
+	}()
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"group/g","messages":[{"role":"user","content":"hi"}]}`)).WithContext(ctx))
+	close(served)
 	r := s.trace.routes[len(s.trace.routes)-1]
 	if b.n != 0 || len(r.Tries) != 1 || r.Tries[0].Fail != failCanceled || r.Tries[0].Rest != nil || s.resting("a") {
 		t.Fatalf("b tried %d, tries %+v", b.n, r.Tries)

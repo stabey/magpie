@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // Stats is what every session spent, day by day: all of them, not only the
@@ -19,16 +21,32 @@ type Stats struct {
 	// spent in it, the most recently active first. Too many to send the
 	// page over a long range: Overview sums them up.
 	Sessions []Summary `json:"-"`
+	// Keys are those sessions' keys, agent:id, in the same order: which of
+	// the sessions the page lists were at work in the range. The list is
+	// every session ever, so without them it guessed from each one's last
+	// line — and a session whose last line is a setting or a fork's seed,
+	// written long after its last call, was listed but not counted.
+	Keys []string `json:"keys"`
 }
 
 // Summary is one session's share of a range.
 type Summary struct {
-	Key   string    `json:"key"` // agent:id as its files are grouped, for Get
-	Agent string    `json:"agent"`
-	ID    string    `json:"id"`
-	Cwd   string    `json:"cwd"`
-	Title string    `json:"title"`
-	Last  time.Time `json:"last"`
+	Key           string        `json:"key"` // agent:id as its files are grouped, for Get
+	Agent         string        `json:"agent"`
+	ID            string        `json:"id"`
+	Cwd           string        `json:"cwd"`
+	Title         string        `json:"title"`
+	Nickname      string        `json:"nickname,omitempty"`
+	Last          time.Time     `json:"last"`
+	Role          string        `json:"role,omitempty"`
+	ParentSession string        `json:"parent_session,omitempty"`
+	RootSession   string        `json:"root_session,omitempty"`
+	ModelEffort   []ModelEffort `json:"model_effort,omitempty"`
+	// Gateway: magpie knows the session only from the gateway's records
+	// (MergeExternalStats). The agent left no file magpie reads, so it has
+	// no folder, and no prompt unless gateway conversations were recorded
+	// (#2285: a Pi subagent's DeepSeek turns read as "(no prompt)").
+	Gateway bool `json:"gateway,omitempty"`
 	Tokens
 	Cost   float64  `json:"cost"`
 	Priced bool     `json:"priced"` // every model it used has a price
@@ -36,7 +54,7 @@ type Summary struct {
 	Models []string `json:"models"` // the models it used in the range, the most used first
 	Days   []int    `json:"days"`   // the dates it was at work on, as days after From
 	// Prompts and Replies are the messages each way, ToolCalls the tools
-	// it called, in the range (Claude Code's and Codex's sessions alone)
+	// it called, in the range (Claude Code's, Codex's, Pi's and omp's sessions)
 	Prompts   int `json:"prompts"`
 	Replies   int `json:"replies"`
 	ToolCalls int `json:"tool_calls"`
@@ -67,7 +85,7 @@ type Usage struct {
 	Cwd   string `json:"cwd"`
 	Model string `json:"model"`
 	Tokens
-	Cost   float64 `json:"cost"` // USD at list price, when priced
+	Cost   float64 `json:"cost"` // USD at the effective price, when priced
 	Priced bool    `json:"priced"`
 }
 
@@ -92,7 +110,29 @@ func StatsFor(days int) Stats {
 // StatsAt is StatsFor as if it were now.
 func StatsAt(days int, now time.Time) Stats { return statsAt(days, now) }
 
-func statsAt(days int, now time.Time) Stats {
+// StatsAndNative is StatsFor, and the agent|id of every session List would
+// list, with no limit: what tells a gateway session the agent keeps too
+// from one only magpie saw. Both come of one pass over the files, as the
+// overview asks for both on every poll (#2776).
+func StatsAndNative(days int) (Stats, map[string]bool) {
+	native := map[string]bool{}
+	return statsIn(days, time.Now(), native), native
+}
+
+func statsAt(days int, now time.Time) Stats { return statsIn(days, now, nil) }
+
+// statsIn is statsAt, filling native as StatsAndNative says when not nil.
+func statsIn(days int, now time.Time, native map[string]bool) Stats {
+	// read before the locks: it reads settings.json
+	alias := provider.UsageAlias()
+	st := statsRead(days, now, native)
+	if alias != nil {
+		st = aliasStats(st, alias)
+	}
+	return st
+}
+
+func statsRead(days int, now time.Time, native map[string]bool) Stats {
 	now = now.In(time.Local)
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
 	var since time.Time
@@ -101,16 +141,33 @@ func statsAt(days int, now time.Time) Stats {
 		since = today.AddDate(0, 0, 1-days)
 		from = since.Format(time.DateOnly)
 	}
-	out := Stats{From: from, To: today.Format(time.DateOnly), Days: []Day{}, Sessions: []Summary{}}
+	out := Stats{From: from, To: today.Format(time.DateOnly), Days: []Day{}, Sessions: []Summary{}, Keys: []string{}}
 
+	storeMu.RLock()
+	defer storeMu.RUnlock()
 	mu.Lock()
 	defer mu.Unlock()
 	loadCache()
-	defer closeDBs()
+	defer useDBs()()
 	files := allFiles()
 	// every changed file, whatever the range, so a wider range picked later
 	// finds them read rather than starting another run
 	refresh(files, files)
+	identities := codexIdentitySnapshot(files)
+	taskTitles := codexSubagentTaskTitles(files)
+	if native != nil {
+		groups := map[string][]file{}
+		for _, f := range files {
+			groups[f.key] = append(groups[f.key], f)
+		}
+		price, titles := pricer(), codexTitleOf()
+		for _, fs := range groups {
+			// as List: a session nothing was said in is not listed
+			if s, ok := assembleListed(fs, price, titles); ok {
+				native[s.Agent+"|"+s.ID] = true
+			}
+		}
+	}
 	var want []file
 	for _, f := range files {
 		if !f.mod.Before(since) {
@@ -208,6 +265,10 @@ func statsAt(days int, now time.Time) Stats {
 			}
 			sh.prompts += d.Prompts
 			sh.replies += d.Replies
+			if d.Prompts+d.Replies > 0 {
+				sh.dates[date] = true
+				dates[date] = true
+			}
 			pd.messages += d.Prompts + d.Replies
 			for name, n := range d.Tools {
 				sh.tools[name] += n
@@ -230,11 +291,11 @@ func statsAt(days int, now time.Time) Stats {
 	for date := range dates {
 		byDate[date] = &Day{Date: date, Usage: []Usage{}, Active: []Active{}}
 	}
-	price := pricer()
+	price, titles := pricer(), codexTitleOf()
 	for k, t := range use {
 		u := Usage{Agent: k.agent, Cwd: k.cwd, Model: k.model, Tokens: t}
 		if p := price(k.model); p != nil {
-			u.Cost, u.Priced = p.Cost(t.Input, t.Output, t.CacheRead, t.CacheWrite), true
+			u.Cost, u.Priced = p.At(0).CostSplit(t.Input, t.Output, t.CacheRead, t.CacheWrite, t.CacheWrite1h), true
 		}
 		byDate[k.date].Usage = append(byDate[k.date].Usage, u)
 	}
@@ -287,12 +348,15 @@ func statsAt(days int, now time.Time) Stats {
 		if len(sh.dates) == 0 {
 			continue
 		}
-		s, ok := assemble(groups[key], price)
+		s, ok := assembleListed(groups[key], price, titles)
 		if !ok {
 			continue
 		}
+		setSessionCodexIdentity(&s, identities)
+		setSessionCodexTaskTitle(&s, taskTitles)
 		sum := Summary{Key: key, Agent: s.Agent, ID: s.ID, Cwd: cmp.Or(folder[key], s.Cwd), Title: clip(s.Title, 160),
-			Last: s.Last, Priced: true, Active: sh.active / 1000, Models: []string{}, Days: []int{},
+			Nickname: s.Nickname,
+			Last:     s.Last, Role: s.Role, ParentSession: s.ParentSession, RootSession: s.RootSession, Priced: true, Active: sh.active / 1000, Models: []string{}, Days: []int{},
 			Prompts: sh.prompts, Replies: sh.replies, tools: sh.tools, skills: sh.skills, skillLast: sh.skillLast,
 			perDay: map[int]*summaryDay{}}
 		for _, n := range sh.tools {
@@ -307,7 +371,7 @@ func statsAt(days int, now time.Time) Stats {
 			sum.Tokens.add(t)
 			sum.Models = append(sum.Models, model)
 			if p := price(model); p != nil {
-				sum.Cost += p.Cost(t.Input, t.Output, t.CacheRead, t.CacheWrite)
+				sum.Cost += p.At(0).CostSplit(t.Input, t.Output, t.CacheRead, t.CacheWrite, t.CacheWrite1h)
 			} else {
 				sum.Priced = false
 			}
@@ -335,6 +399,10 @@ func statsAt(days int, now time.Time) Stats {
 		}
 		return a.Key < b.Key
 	})
+	// keys after the sort, so they name the sessions in the order they are in
+	for _, s := range out.Sessions {
+		out.Keys = append(out.Keys, s.Key)
+	}
 	return out
 }
 
@@ -620,17 +688,17 @@ func skillUse(in []Summary, n int) SkillUse {
 // Tool (an MCP server's) or Other.
 func ToolCategory(name string) string {
 	switch name {
-	case "Bash", "BashOutput", "KillShell", "KillBash", "exec_command", "shell", "shell_command", "local_shell_call", "write_stdin", "unified_exec":
+	case "Bash", "BashOutput", "KillShell", "KillBash", "exec_command", "shell", "shell_command", "local_shell_call", "write_stdin", "unified_exec", "bash", "powershell":
 		return "Bash"
 	case "Edit", "MultiEdit", "NotebookEdit", "apply_patch", "edit", "str_replace":
 		return "Edit"
-	case "Read", "NotebookRead", "view_image", "read_file", "view":
+	case "Read", "NotebookRead", "view_image", "read_file", "view", "read":
 		return "Read"
-	case "Write", "write_file", "create":
+	case "Write", "write_file", "create", "write":
 		return "Write"
-	case "Glob", "LS", "list_dir", "glob":
+	case "Glob", "LS", "list_dir", "glob", "find", "ls", "fffind":
 		return "Glob"
-	case "Grep", "grep", "grep_files", "search":
+	case "Grep", "grep", "grep_files", "search", "ffgrep":
 		return "Grep"
 	case "Task", "Agent", "TodoWrite", "update_plan", "spawn_agent", "send_input", "wait", "close_agent", "Workflow":
 		return "Task"

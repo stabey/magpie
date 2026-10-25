@@ -34,6 +34,10 @@ func TestCheckSkills(t *testing.T) {
 			w.Write(tarball(t, files))
 			return
 		}
+		if strings.Contains(r.URL.Path, "/git/trees/") {
+			w.WriteHeader(404) // what the repositories added since is TestCheckSkillsFindsNewOnes's
+			return
+		}
 		repo := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/repos/"), "/commits")
 		asked["api "+repo]++
 		if r.URL.Query().Get("per_page") != "1" {
@@ -153,7 +157,7 @@ func TestCheckSkills(t *testing.T) {
 	clear(asked)
 	got = check(t)
 	for _, n := range []string{"pdf", "docx", "x", "y"} {
-		if c := got[n]; c.Status != "unknown" || c.Error != (errLimited{until: time.Unix(2000000000, 0)}).Error() {
+		if c := got[n]; c.Status != "unknown" || c.Error != (errLimited{Until: time.Unix(2000000000, 0)}).Error() {
 			t.Errorf("%s: %+v", n, c)
 		}
 	}

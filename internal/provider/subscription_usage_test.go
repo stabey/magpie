@@ -2,6 +2,11 @@ package provider
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -40,9 +45,29 @@ func TestSubscriptionUsageServesStale(t *testing.T) {
 	if err := Delete("codex"); err != nil {
 		t.Fatal(err)
 	}
+	// The refresh is held at the vendor, so a copy that waited for it could
+	// not come back: what the stale copy returns, it returns while the
+	// refresh is still in flight (#1586). Held rather than timed, because a
+	// loaded machine makes a wall-clock bound say nothing either way.
+	held := make(chan struct{})
+	reached := make(chan struct{})
+	var releaseOnce, reachedOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(held) }) }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reachedOnce.Do(func() { close(reached) })
+		<-held
+		w.Write([]byte(`{"copilot_plan":"individual","token_based_billing":true,"quota_snapshots":` +
+			`{"premium_interactions":{"has_quota":true,"unlimited":false,"entitlement":"300","percent_remaining":50}}}`))
+	}))
+	oldUser := CopilotUserURL
+	CopilotUserURL = srv.URL
+	t.Cleanup(func() { CopilotUserURL = oldUser })
+
 	c := &subscriptionUsageCache
 	c.Lock()
-	c.at, c.pending = time.Now().Add(-time.Hour), nil
+	// all four fields the call reads: asked is part of the state this test
+	// primes, not something to inherit from whatever ran before it
+	c.at, c.asked, c.pending = time.Now().Add(-time.Hour), false, nil
 	c.data = []SubscriptionQuota{{Provider: "claude", Name: "Claude Code"}, {Provider: "codex", Name: "Codex"}}
 	c.Unlock()
 	t.Cleanup(func() {
@@ -58,27 +83,36 @@ func TestSubscriptionUsageServesStale(t *testing.T) {
 			<-p
 		}
 	})
+	// before the wait above, which the held vendor would otherwise keep
+	// blocked, and before the process is left with a server nobody closes
+	t.Cleanup(func() { release(); srv.Close() })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	// The deadline is only so a copy that did wait fails as a FAIL rather
+	// than hanging the run: nothing here is measured against it.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	start := time.Now()
 	got := SubscriptionUsage(ctx)
-	if time.Since(start) > 40*time.Millisecond {
-		t.Fatalf("waited %v for a stale copy", time.Since(start))
-	}
 	if len(got) != 1 || got[0].Provider != "claude" {
-		t.Fatalf("got %+v, want only claude", got)
+		t.Fatalf("got %+v, want only claude: a copy that waited for the held refresh comes back with nothing", got)
 	}
-	c.Lock()
-	refreshing := c.pending != nil || time.Since(c.at) < time.Minute
-	c.Unlock()
-	if !refreshing {
+	if !SubscriptionUsageReading() {
+		t.Fatal("the copy came back with no refresh in flight")
+	}
+	select {
+	case <-reached:
+	case <-time.After(15 * time.Second):
 		t.Fatal("a stale copy did not start a refresh")
 	}
 	// what showed the stale copy hears when the new one lands
 	landed := make(chan struct{}, 1)
-	OnSubscriptionUsage = func() { landed <- struct{}{} }
-	t.Cleanup(func() { OnSubscriptionUsage = nil })
+	OnSubscriptionUsage(func() {
+		select {
+		case landed <- struct{}{}:
+		default:
+		}
+	})
+	t.Cleanup(func() { OnSubscriptionUsage(nil) })
+	release()
 	c.Lock()
 	p := c.pending
 	c.at = time.Time{}
@@ -117,5 +151,56 @@ func TestChosenWindows(t *testing.T) {
 	got = chosenWindows(ag, map[string]bool{"gemini-3.7-flash": true, "claude-opus-4-6-thinking": true}, base)
 	if len(got) != 3 || got[0].Model != "gemini-3.7-flash-high" || got[1].Model != "gemini-3.7-flash-low" || got[2].Model != "claude-opus-4-6-thinking" {
 		t.Fatalf("antigravity: %+v", got)
+	}
+}
+
+// A Copilot account magpie signed in itself gets its card even when the
+// editors' own sign-in isn't on the machine: every account magpie knows is
+// asked, not only the one the editors' or the CLI's token belongs to.
+func TestCopilotQuotaWithoutEditorsSignIn(t *testing.T) {
+	home := signIn(t)
+	t.Setenv("COPILOT_HOME", filepath.Join(home, ".copilot")) // not the machine's own CLI, when it has one
+	// the editors' own sign-in gone: what magpie keeps is all that's left
+	for _, dir := range []string{filepath.Join(home, ".config", "github-copilot"), filepath.Join(home, ".copilot")} {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok := copilotLogin(filepath.Join(home, ".config")); ok {
+		t.Fatal("the editors' own sign-in is still readable")
+	}
+	if err := addCopilotLogin("hubot", "Pro+", "ghu_hubot", ""); err != nil {
+		t.Fatal(err)
+	}
+	if ls := copilotLoginList(); len(ls) != 1 || ls[0].User != "hubot" {
+		t.Fatalf("copilotLoginList = %+v", ls)
+	}
+
+	old := CopilotUserURL
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "token ghu_hubot" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Write([]byte(`{"copilot_plan":"individual_pro","quota_snapshots":{"premium_interactions":{"has_quota":true,"entitlement":7000,"quota_remaining":6996}}}`))
+	}))
+	defer srv.Close()
+	CopilotUserURL = srv.URL
+	t.Cleanup(func() { CopilotUserURL = old })
+
+	var card *SubscriptionQuota
+	for _, q := range fetchSubscriptionUsage(context.Background()) {
+		if q.Provider == "copilot" {
+			card = &q
+		}
+	}
+	if card == nil {
+		t.Fatal("no Copilot card: an account signed in from magpie alone was left out")
+	}
+	if card.User != "hubot" || card.Plan != "Pro+" || len(card.Windows) != 1 {
+		t.Fatalf("Copilot card = %+v", *card)
+	}
+	if w := card.Windows[0]; w.Name != "Premium requests" || w.Display != "4 / 7000" {
+		t.Fatalf("window = %+v", w)
 	}
 }

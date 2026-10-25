@@ -8,6 +8,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // fakeRTK is an rtk on PATH that acts as rtk 0.50's installer does for
@@ -35,10 +38,7 @@ func TestRTK(t *testing.T) {
 	}
 	h := sandbox(t)
 	bin := filepath.Join(h, "bin")
-	write(t, filepath.Join(bin, "rtk"), fakeRTK)
-	if err := os.Chmod(filepath.Join(bin, "rtk"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testenv.Program(t, filepath.Join(bin, "rtk"), fakeRTK)
 	t.Setenv("PATH", bin)
 	state := func() map[string]bool {
 		m := map[string]bool{}
@@ -101,6 +101,7 @@ func TestRTK(t *testing.T) {
 func TestRTKRemove(t *testing.T) {
 	h := sandbox(t)
 	hook := func(key, matcher, cmd string) string {
+		quoted, _ := json.Marshal(cmd) // a Windows path has backslashes
 		return `"hooks": {
     "` + key + `": [
       {
@@ -108,7 +109,7 @@ func TestRTKRemove(t *testing.T) {
         "hooks": [
           {
             "type": "command",
-            "command": "` + cmd + `"
+            "command": ` + string(quoted) + `
           }
         ]
       }
@@ -209,53 +210,90 @@ func TestRTKRemove(t *testing.T) {
 	}
 }
 
-// TestRTKOpenCode2: rtk's OpenCode plugin is written for OpenCode 1, and
-// OpenCode 2 refuses to load it (rtk-ai/rtk#4311), so with an OpenCode 2
-// here rtk isn't given to OpenCode; one given before can still be taken out.
-// An OpenCode 1 still gets it.
+// openCodeRTK is an rtk on PATH that says it is version and, for
+// rtk init -g --opencode, writes the plugin that version writes: up to 0.51
+// one for OpenCode 1 only (hooks/opencode/rtk.ts at v0.51.0), from 0.52 one
+// default object with OpenCode 2's id and setup() (rtk-ai/rtk#4187, the
+// file at v1.0.1).
+func openCodeRTK(version string) string {
+	plugin := `export const RtkOpenCodePlugin: Plugin = async ({ $ }) => {`
+	if !older(version, 0, 52) {
+		plugin = `const RtkOpenCodePlugin = {
+  id: "rtk",
+  async setup(ctx: any) {},
+  async server() {},
+}
+export default RtkOpenCodePlugin`
+	}
+	return `#!/bin/sh
+case "$1" in
+--version) echo "rtk ` + version + `"; exit 0 ;;
+esac
+shift 2
+case "$*" in
+"--opencode --auto-patch") /bin/mkdir -p "$XDG_CONFIG_HOME/opencode/plugins"; /bin/cat > "$XDG_CONFIG_HOME/opencode/plugins/rtk.ts" <<'PLUGIN'
+` + plugin + `
+PLUGIN
+;;
+*) echo "unknown: $*" >&2; exit 2 ;;
+esac
+`
+}
+
+// TestRTKOpenCode2: OpenCode 2 refuses the OpenCode 1 plugin rtk wrote up
+// to 0.51 (rtk-ai/rtk#4311), and loads the one rtk 0.52 on writes
+// (rtk-ai/rtk#4187; #2295, witt-bit, on rtk 1.0.1). So with an OpenCode 2
+// here an older rtk isn't run for OpenCode, and one given before can still
+// be taken out; a newer rtk is, and its plugin is on. An old plugin left
+// from before an rtk update counts as off once rtk can write the new one,
+// and switching it on writes that over it. An OpenCode 1 gets rtk from
+// either.
 func TestRTKOpenCode2(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the fakes are shell scripts")
 	}
 	h := sandbox(t)
 	bin := filepath.Join(h, "bin")
-	write(t, filepath.Join(bin, "rtk"), fakeRTK)
+	rtk := func(version string) {
+		t.Helper()
+		testenv.Program(t, filepath.Join(bin, "rtk"), openCodeRTK(version))
+	}
 	opencode := func(version string) {
 		t.Helper()
-		write(t, filepath.Join(bin, "opencode"), "#!/bin/sh\necho "+version+"\n")
-		for _, f := range []string{"rtk", "opencode"} {
-			if err := os.Chmod(filepath.Join(bin, f), 0o755); err != nil {
-				t.Fatal(err)
-			}
-		}
+		testenv.Program(t, filepath.Join(bin, "opencode"), "#!/bin/sh\necho "+version+"\n")
 	}
 	t.Setenv("PATH", bin)
 	plugin := filepath.Join(h, ".config", "opencode", "plugins", "rtk.ts")
-	blocked := func() string {
+	row := func() RTKAgent {
 		t.Helper()
 		for _, a := range ReadRTK().Agents {
 			if a.ID == "opencode" {
-				return a.Blocked
+				return a
 			}
 		}
 		t.Fatal("opencode isn't listed")
-		return ""
+		return RTKAgent{}
 	}
 
 	// what each prints for --version
+	rtk("0.51.0")
 	opencode("opencode v2.0.18")
-	if b := blocked(); !strings.Contains(b, "OpenCode 2.0.18") {
+	if b := row().Blocked; !strings.Contains(b, "OpenCode 2.0.18") || !strings.Contains(b, "0.51.0") {
 		t.Fatalf("blocked: %q", b)
 	}
 	_, err := SetRTK("opencode", true)
-	if err == nil || !strings.Contains(err.Error(), "doesn't support OpenCode 2") {
-		t.Fatalf("switched on for OpenCode 2: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "needs RTK 0.52 or newer") {
+		t.Fatalf("rtk 0.51 switched on for OpenCode 2: %v", err)
 	}
 	if exists(plugin) {
-		t.Fatal("rtk's plugin was written for OpenCode 2")
+		t.Fatal("rtk 0.51's plugin was written for OpenCode 2")
 	}
-	// one written before (by an older magpie, or rtk init by hand) goes
-	write(t, plugin, "x")
+	// one written before (by an older magpie, or rtk init by hand) is on,
+	// and goes
+	write(t, plugin, "export const RtkOpenCodePlugin: Plugin = async ({ $ }) => {\n")
+	if !row().On {
+		t.Fatal("an old plugin under OpenCode 2 and rtk 0.51 isn't listed as on, so it can't be taken out")
+	}
 	if _, err := SetRTK("opencode", false); err != nil {
 		t.Fatal(err)
 	}
@@ -263,15 +301,59 @@ func TestRTKOpenCode2(t *testing.T) {
 		t.Fatal("rtk's plugin is still there")
 	}
 
-	opencode("1.18.32")
-	if b := blocked(); b != "" {
-		t.Fatalf("OpenCode 1 blocked: %q", b)
+	// rtk 1.0.1 writes a plugin OpenCode 2 loads
+	rtk("1.0.1")
+	if a := row(); a.Blocked != "" || a.On {
+		t.Fatalf("rtk 1.0.1, OpenCode 2: blocked %q, on %v", a.Blocked, a.On)
+	}
+	if _, err := SetRTK("opencode", true); err != nil {
+		t.Fatalf("rtk 1.0.1 not given to OpenCode 2: %v", err)
+	}
+	if !contains(plugin, "setup(") || !row().On {
+		t.Fatal("OpenCode 2 didn't get rtk 1.0.1's plugin")
+	}
+	if _, err := SetRTK("opencode", false); err != nil || exists(plugin) {
+		t.Fatalf("rtk 1.0.1's plugin not taken out: %v", err)
+	}
+	// rtk 0.52 is the first that writes it
+	rtk("0.52.0")
+	if b := row().Blocked; b != "" {
+		t.Fatalf("rtk 0.52.0 blocked for OpenCode 2: %q", b)
+	}
+
+	// rtk updated over an old plugin: it's off until switched on, which
+	// writes the new one
+	rtk("1.0.1")
+	write(t, plugin, "export const RtkOpenCodePlugin: Plugin = async ({ $ }) => {\n")
+	if row().On {
+		t.Fatal("OpenCode 1's plugin under OpenCode 2 is listed as on")
 	}
 	if _, err := SetRTK("opencode", true); err != nil {
 		t.Fatal(err)
 	}
-	if !exists(plugin) {
-		t.Fatal("OpenCode 1 didn't get rtk's plugin")
+	if !contains(plugin, "setup(") {
+		t.Fatal("the old plugin wasn't written over")
+	}
+	if err := os.Remove(plugin); err != nil {
+		t.Fatal(err)
+	}
+
+	// OpenCode 1 gets rtk from an old rtk and a new one
+	for _, v := range []string{"0.51.0", "1.0.1"} {
+		rtk(v)
+		opencode("1.18.32")
+		if b := row().Blocked; b != "" {
+			t.Fatalf("OpenCode 1 blocked with rtk %s: %q", v, b)
+		}
+		if _, err := SetRTK("opencode", true); err != nil {
+			t.Fatal(err)
+		}
+		if !exists(plugin) || !row().On {
+			t.Fatalf("OpenCode 1 didn't get rtk %s's plugin", v)
+		}
+		if _, err := SetRTK("opencode", false); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -303,10 +385,7 @@ func TestRTKCodexOld(t *testing.T) {
 	bin := filepath.Join(h, "bin")
 	rtk := func(version, init string) {
 		t.Helper()
-		write(t, filepath.Join(bin, "rtk"), "#!/bin/sh\ncase \"$1\" in\n--version) echo \"rtk "+version+"\"; exit 0 ;;\ngain) exit 1 ;;\nesac\n"+init+"\n")
-		if err := os.Chmod(filepath.Join(bin, "rtk"), 0o755); err != nil {
-			t.Fatal(err)
-		}
+		testenv.Program(t, filepath.Join(bin, "rtk"), "#!/bin/sh\ncase \"$1\" in\n--version) echo \"rtk "+version+"\"; exit 0 ;;\ngain) exit 1 ;;\nesac\n"+init+"\n")
 	}
 	t.Setenv("PATH", bin)
 	write(t, filepath.Join(codex, "config.toml"), "")
@@ -343,5 +422,237 @@ func TestRTKCodexOld(t *testing.T) {
 		if older(v, 0, 50) != want {
 			t.Errorf("older(%q) = %v", v, !want)
 		}
+	}
+}
+
+// #741: the RTK page said "nothing saved yet" while rtk gain had records.
+// rtk's stdout and stderr were read as one, so anything rtk warned about on
+// stderr (an outdated hook, a console code page, a table it can't find) went
+// in front of the JSON and none of it was read; stdout is now read alone,
+// a line around the JSON object is passed over, and an rtk gain that fails
+// or prints nothing readable is said instead of "nothing saved".
+func TestRTKGainRead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake rtk is a shell script")
+	}
+	h := sandbox(t)
+	bin := filepath.Join(h, "bin")
+	gain := func(body string) {
+		t.Helper()
+		testenv.Program(t, filepath.Join(bin, "rtk"), "#!/bin/sh\ncase \"$1\" in\n--version) echo 'rtk 0.51.0'; exit 0 ;;\ngain) "+body+" ;;\nesac\nexit 2\n")
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+"/bin"+string(os.PathListSeparator)+"/usr/bin")
+	summary := `{"summary":{"total_commands":42,"total_input":9000,"total_output":1000,"total_saved":8000,"avg_savings_pct":88.9,"total_time_ms":10,"avg_time_ms":0},"daily":[{"date":"2026-10-03","commands":42,"input_tokens":9000,"output_tokens":1000,"saved_tokens":8000,"savings_pct":88.9,"total_time_ms":10,"avg_time_ms":0}]}`
+
+	gain(`echo '[rtk] warning: no decoder for console code page 936; non-UTF-8 output will be shown with replacement characters' >&2; echo '` + summary + `'; exit 0`)
+	if v := ReadRTK(); v.Gain == nil || v.Gain.Commands != 42 || v.Gain.Saved != 8000 || len(v.Days) != 1 || v.GainErr != "" {
+		t.Fatalf("stderr warning: gain %+v, days %+v, err %q", v.Gain, v.Days, v.GainErr)
+	}
+	gain(`echo '[rtk] notice: tee files moved'; echo '` + summary + `'; exit 0`)
+	if v := ReadRTK(); v.Gain == nil || v.Gain.Commands != 42 {
+		t.Fatalf("stdout notice: gain %+v, err %q", v.Gain, v.GainErr)
+	}
+	// no commands yet: nothing saved, and nothing wrong
+	gain(`echo '{"summary":{"total_commands":0,"total_input":0,"total_saved":0,"avg_savings_pct":0}}'; exit 0`)
+	if v := ReadRTK(); v.Gain != nil || v.GainErr != "" {
+		t.Fatalf("empty: gain %+v, err %q", v.Gain, v.GainErr)
+	}
+	gain(`echo 'Error: Failed to initialize tracking database' >&2; echo 'Caused by: database is locked' >&2; exit 1`)
+	if v := ReadRTK(); v.Gain != nil || v.GainErr != "rtk gain: Error: Failed to initialize tracking database Caused by: database is locked" {
+		t.Fatalf("failed: gain %+v, err %q", v.Gain, v.GainErr)
+	}
+	gain(`echo 'No tracking data yet.'; exit 0`)
+	if v := ReadRTK(); v.Gain != nil || v.GainErr != "rtk gain printed no summary magpie can read: No tracking data yet." {
+		t.Fatalf("not JSON: gain %+v, err %q", v.Gain, v.GainErr)
+	}
+}
+
+// What rtk saves in Codex's Windows sandbox isn't in rtk gain: elevated, its
+// commands run as Codex's sandbox account, with that account's AppData;
+// unelevated, they can't write the user's. Read from Codex's config.toml.
+func TestCodexSandbox(t *testing.T) {
+	h := sandbox(t)
+	t.Setenv("CODEX_HOME", filepath.Join(h, ".codex"))
+	for conf, want := range map[string]string{
+		"":                                      "",
+		"[windows]\nsandbox = \"elevated\"\n":   "elevated",
+		"[windows]\nsandbox = \"unelevated\"\n": "unelevated",
+		"[windows]\nsandbox = \"mxc\"\n":        "",
+		"[features]\nelevated_windows_sandbox = true\n":                              "elevated",
+		"[features]\nexperimental_windows_sandbox = true\n":                          "unelevated",
+		"sandbox_mode = \"danger-full-access\"\n[windows]\nsandbox = \"elevated\"\n": "",
+		"model = \"gpt-5\"\n": "",
+	} {
+		write(t, filepath.Join(h, ".codex", "config.toml"), conf)
+		if got := codexSandbox(); got != want {
+			t.Errorf("%q: %q, want %q", conf, got, want)
+		}
+	}
+}
+
+// TestRTKNoHookListed (Discord, lc: rtk 没有识别 deepseek harness): an
+// agent RTK has no hook for, DeepSeek Harness, is listed all the same with
+// why, not left out as if magpie hadn't seen it, and it can't be switched on.
+func TestRTKNoHookListed(t *testing.T) {
+	h := sandbox(t)
+	bin := filepath.Join(h, "bin")
+	testenv.Program(t, filepath.Join(bin, "dsh"), "#!/bin/sh\n")
+	write(t, filepath.Join(bin, "dsh.exe"), "")
+	var dsh *RTKAgent
+	for _, a := range ReadRTK().Agents {
+		if a.ID == "dsh" {
+			dsh = &a
+		}
+	}
+	if dsh == nil {
+		t.Fatal("DeepSeek Harness isn't listed")
+	}
+	// what the page reads: noHook, and Blocked saying why
+	if b, _ := json.Marshal(dsh); dsh.On || !strings.Contains(string(b), `"noHook":true`) || !strings.Contains(dsh.Blocked, "rewriting the shell command") {
+		t.Fatalf("listed as %s", b)
+	}
+	if _, err := SetRTK("dsh", true); err == nil || !strings.Contains(err.Error(), "DeepSeek Harness") {
+		t.Fatalf("switched on: %v", err)
+	}
+	if _, err := RTKTakes("dsh"); err == nil || !strings.Contains(err.Error(), "rewriting the shell command") {
+		t.Fatalf("magpie library rtk on dsh: %v", err)
+	}
+}
+
+// fakeRTKHermes acts as rtk 0.51's rtk init -g --agent hermes does
+// (src/hooks/init/hermes.rs): its plugin and config go into $HERMES_HOME,
+// else ~/.hermes, whatever the OS. It notes the HERMES_HOME it was given.
+const fakeRTKHermes = `#!/bin/sh
+case "$1" in
+--version) echo "rtk 0.51.0"; exit 0 ;;
+gain) echo '{"summary":{}}'; exit 0 ;;
+esac
+shift 2
+[ "$*" = "--agent hermes --auto-patch" ] || { echo "unknown: $*" >&2; exit 2; }
+h="${HERMES_HOME:-$HOME/.hermes}"
+echo "$HERMES_HOME" > "$HOME/given"
+/bin/mkdir -p "$h/plugins/rtk-rewrite"
+echo "name: rtk-rewrite" > "$h/plugins/rtk-rewrite/plugin.yaml"
+echo "x" > "$h/plugins/rtk-rewrite/__init__.py"
+printf 'plugins:\n  enabled:\n    - rtk-rewrite\n' >> "$h/config.yaml"
+echo "Config: $h/config.yaml"
+echo "Hermes will now rewrite terminal commands through rtk. Restart Hermes."
+echo "Test with: git status"
+`
+
+// TestRTKHermesHome (新v学员 on Discord, native Windows): Hermes's folder is
+// %LOCALAPPDATA%\hermes there, and rtk's installer wrote its plugin into it,
+// while magpie looked for the plugin in ~/.hermes: "rtk's installer didn't
+// add its hook to Hermes Agent". The plugin is looked for, and taken out,
+// in Hermes's own folder (appdir.HermesHome), and the installer is told
+// that folder, since rtk itself knows only $HERMES_HOME and ~/.hermes.
+func TestRTKHermesHome(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake rtk is a shell script")
+	}
+	h := sandbox(t)
+	bin := filepath.Join(h, "bin")
+	testenv.Program(t, filepath.Join(bin, "rtk"), fakeRTKHermes)
+	holdCLI(t, h, "hermes") // the config alone is gone (#2254)
+	t.Setenv("PATH", bin)
+	for _, c := range []struct{ name, env string }{
+		// the reporter's layout: Hermes's folder isn't ~/.hermes
+		{"elsewhere", filepath.Join(h, "AppData", "Local", "hermes")},
+		// Hermes's default here: rtk is still told it, which on Windows
+		// is the one way it writes where Hermes reads
+		{"default", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("HERMES_HOME", c.env)
+			dir := appdir.HermesHome()
+			if c.env != "" && dir != c.env {
+				t.Fatalf("Hermes's folder is %s, want %s", dir, c.env)
+			}
+			cfg := filepath.Join(dir, "config.yaml")
+			write(t, cfg, "model:\n  default: x\n")
+			if _, err := SetRTK("hermes", true); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.TrimSpace(read(t, filepath.Join(h, "given"))); got != dir {
+				t.Errorf("rtk was given HERMES_HOME=%q, want %q", got, dir)
+			}
+			if !exists(filepath.Join(dir, "plugins", "rtk-rewrite", "plugin.yaml")) {
+				t.Fatalf("no plugin in %s", dir)
+			}
+			if c.env != "" && exists(filepath.Join(h, ".hermes")) {
+				t.Error("~/.hermes was made beside Hermes's own folder")
+			}
+			on := false
+			for _, a := range ReadRTK().Agents {
+				if a.ID == "hermes" {
+					on = a.On
+				}
+			}
+			if !on {
+				t.Fatal("Hermes isn't seen with rtk on")
+			}
+			if _, err := SetRTK("hermes", false); err != nil {
+				t.Fatal(err)
+			}
+			if exists(filepath.Join(dir, "plugins", "rtk-rewrite")) {
+				t.Error("rtk's plugin is still in Hermes's folder")
+			}
+			if got := read(t, cfg); got != "model:\n  default: x\n" {
+				t.Errorf("config.yaml = %q", got)
+			}
+			os.RemoveAll(dir)
+		})
+	}
+}
+
+// Grok App is listed on the RTK tab with the switch unable to turn on:
+// rtk init has no Grok agent, so there is nothing to install.
+func TestRTKNoHookGrokApp(t *testing.T) {
+	h := sandbox(t)
+	root := filepath.Join(h, "grok-app-data")
+	t.Setenv("GROK_APP_HOME", root)
+	write(t, filepath.Join(root, "agent-home", "config.toml"), "")
+	var app *RTKAgent
+	for _, a := range ReadRTK().Agents {
+		if a.ID == "grok-app" {
+			app = &a
+		}
+	}
+	if app == nil {
+		t.Fatal("Grok App isn't listed")
+	}
+	if b, _ := json.Marshal(app); app.On || !strings.Contains(string(b), `"noHook":true`) || !strings.Contains(app.Blocked, "no Grok or Grok App agent") {
+		t.Fatalf("listed as %s", b)
+	}
+	if _, err := SetRTK("grok-app", true); err == nil || !strings.Contains(err.Error(), "Grok App") {
+		t.Fatalf("switched on: %v", err)
+	}
+	if _, err := RTKTakes("grok-app"); err == nil || !strings.Contains(err.Error(), "no Grok or Grok App agent") {
+		t.Fatalf("magpie library rtk on grok-app: %v", err)
+	}
+}
+
+// Grok Build, which Grok App runs, has no rtk agent either (#1625's
+// sibling): it is listed with the switch off, never switched on.
+func TestRTKNoHookGrokBuild(t *testing.T) {
+	h := sandbox(t)
+	write(t, filepath.Join(h, ".grok", "config.toml"), "")
+	var grok *RTKAgent
+	for _, a := range ReadRTK().Agents {
+		if a.ID == "grok" {
+			grok = &a
+		}
+	}
+	if grok == nil {
+		t.Fatal("Grok Build isn't listed")
+	}
+	if b, _ := json.Marshal(grok); grok.On || !strings.Contains(string(b), `"noHook":true`) || !strings.Contains(grok.Blocked, "no Grok agent") {
+		t.Fatalf("listed as %s", b)
+	}
+	if _, err := SetRTK("grok", true); err == nil || !strings.Contains(err.Error(), "Grok Build") {
+		t.Fatalf("switched on: %v", err)
+	}
+	if _, err := RTKTakes("grok"); err == nil || !strings.Contains(err.Error(), "no Grok agent") {
+		t.Fatalf("magpie library rtk on grok: %v", err)
 	}
 }
