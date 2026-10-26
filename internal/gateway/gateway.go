@@ -614,6 +614,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	defer stopLimits()
 	freshCtx, stopFresh := context.WithCancel(ctx)
 	defer stopFresh()
+	// what another process writes to them is seen at once, not on the
+	// loops' next look (#3185)
+	go filememo.Watch(freshCtx, pluginrt.Path(), settings.Path(), provider.Path(), plugin.ListPath(), plugin.ToolsPath(), access.Path())
 	go pluginrt.KeepFresh(freshCtx, filememo.OthersEvery, settings.Path(), provider.Path(), plugin.ListPath(), plugin.ToolsPath(), access.Path())
 	srv := &http.Server{Handler: s.Front(), ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 5 * time.Minute}
 	// the magpie serving the gateway, and only it, keeps the saved accounts
@@ -787,7 +790,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, provider.Chat, http.StatusNotFound, "magpie serves /v1/chat/completions, /v1/responses, /v1/messages, /v1/systemone, /v1/images/generations, /v1/images/edits, /v1/videos, /v1/embeddings, /v1/rerank, /v1/audio/transcriptions, /v1/audio/translations and /v1beta/models/*")
 	})
-	return s.counted(holdCatalog(corsGuard(callerGuard(withCaller(keyLimited(mux))))))
+	// the goroutine dump first, ahead of every lock the rest can be stuck
+	// on (dumpFirst)
+	return s.dumpFirst(s.counted(holdCatalog(corsGuard(callerGuard(withCaller(keyLimited(mux)))))))
 }
 
 // responsesOverHTTP answers a GET on /v1/responses, which is how a client
